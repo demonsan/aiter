@@ -110,6 +110,31 @@ same sequence, so results are bit-identical to v0), and every store is still
 predicated *and* clamped.  ``columns % 4 != 0`` is handled per column: the
 thread still loads its whole page (all addresses stay inside the cache, the page
 index is clamped) and stores only the columns that exist.
+
+Optimization round A / second commit (``rows_per_thread``): the **fp8** path also
+groups ``rpt`` consecutive query rows per thread.  v1 still decodes the same
+E4M3 key bytes once per *output*, and on gfx1250 there is no legal fp8->f32
+convert, so that software decode is ~1900 instructions per output -- about 40 %
+of the fp8 kernel.  A key row is shared by every row of its request, so with
+``rpt`` rows per thread the decode (and the key loads) happen once and are
+reused ``rpt`` times.  Whether the rows of a group share a request is a property
+of the caller's row -> request map, so the kernel tests it at run time on a
+**workgroup-uniform** condition (``token_to_request[row0 + i]`` are block-level
+values, identical for every lane) and:
+
+* ``if same_req`` -- fast path: one page-table lookup, one key load/decode per
+  (8-dim step, column), reused by all ``rpt`` rows; Q stays per row;
+* ``if diff_req`` -- fallback: each row of the group runs the full single-row
+  body with its own page, i.e. exactly the ``rpt == 1`` code, so a straddling
+  group is still computed correctly.
+
+Both paths are traced as separate regions and each computes and stores its own
+results, so no value has to escape a region.  ``rpt`` is chosen on the host from
+shape scalars only (``rows // num_requests``), never from device data, and is 1
+for bf16 (no decode to amortise) and 1 for the draft shape (1 row per request,
+nothing to share, keep the 4x larger grid).  ``_g2/test_contract_cpu.py`` proves
+the two paths agree bitwise on uniform groups and that the guard fires -- and
+the fast path would be wrong -- on a deliberately straddling map.
 """
 
 from __future__ import annotations
@@ -130,6 +155,7 @@ NUM_HEADS = 4          # index heads
 HEAD_DIM = 128         # index head dim
 DIM_PER_STEP = 8       # head dims consumed per unrolled step (16 B of Q)
 THREADS = 256          # threads per workgroup (one thread per compressed page)
+RPT_MAX = 4            # max query rows grouped per thread (fast path, fp8 only)
 MAX_GRID_Y = 65535
 _NEG_INF = float("-inf")
 # A V# with num_records == 0 is *unbounded* (no bounds check at all), so every
@@ -373,9 +399,40 @@ def _grid_x(columns: int, threads: int = THREADS) -> int:
     return max(1, (pages + int(threads) - 1) // int(threads))
 
 
+def _grid_y(rows: int, rows_per_thread: int = 1) -> int:
+    """grid.y: one workgroup per group of ``rows_per_thread`` query rows."""
+    rpt = int(rows_per_thread)
+    return max(1, (int(rows) + rpt - 1) // rpt)
+
+
 @lru_cache(maxsize=None)
-def _build_kernel(is_fp8: bool, threads: int, divisor: float):
-    """One specialization per (dtype, block size, score divisor)."""
+def _build_kernel(is_fp8: bool, threads: int, divisor: float,
+                  rows_per_thread: int = 1):
+    """One specialization per (dtype, block size, score divisor, row group).
+
+    ``rows_per_thread`` (``rpt``) groups ``rpt`` consecutive query rows into one
+    thread so that a page's keys are loaded/decoded **once** and reused by all
+    ``rpt`` rows.  That is only valid when the group's rows share one request
+    (the page table is per request), which is a property of the *caller's*
+    row -> request map, so the kernel checks it at run time on a
+    **workgroup-uniform** condition and takes one of two paths:
+
+    * ``if same_req``  -- all ``rpt`` rows have the same ``token_to_request``:
+      one page-table lookup, one K load/decode per (8-dim step, column), reused
+      by the ``rpt`` rows.  This is the fast path and it is what the e4m3
+      software decode (the dominant fp8 instruction term) is amortised over.
+    * ``if diff_req``  -- the group straddles requests: each row does the full
+      per-row load/decode exactly like ``rpt == 1``, i.e. the fallback is
+      bit-identical to the single-row kernel, just with ``rpt`` rows per thread.
+
+    Both paths store per (row, column) under the same predicates, so the
+    fallback is always correct; ``rpt == 1`` emits a single path (the v1 body)
+    at build time.  ``rpt`` is chosen by the wrapper from host shape scalars
+    only (``rows / num_requests``), never from device data.
+    """
+    rpt = int(rows_per_thread)
+    if rpt < 1:
+        raise ValueError(f"rows_per_thread must be >= 1, got {rpt}")
     key_row_bytes = HEAD_DIM if is_fp8 else HEAD_DIM * 2   # 128 B fp8 / 256 B bf16
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2                 # 1024 B bf16
     page_bytes = PAGE_SIZE * key_row_bytes                 # 512 B fp8 / 1024 B bf16
@@ -387,7 +444,8 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     dtype_tag = "fp8" if is_fp8 else "bf16"
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtype_tag}"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_pg4_flydsl"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_pg{PAGE_SIZE}"
+        f"_r{rpt}_flydsl"
     )
 
     # The kernel body must not branch on this flag: an `if` over a closure
@@ -456,13 +514,15 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         width: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
-        row = fx.Int32(fx.block_idx.y)
         ptile = fx.Int32(fx.block_idx.x)
         # One thread per compressed page: the page is PAGE_SIZE *consecutive*
         # columns that share one page-table entry and one physical page block,
         # so `page` is both the logical page index and the column-block index.
         page = ptile * threads + tid
         col0 = page * PAGE_SIZE
+        # This thread's group of `rpt` consecutive query rows (the last group of
+        # the grid may be short: `live_i[i]` is false for the missing rows).
+        row0 = fx.Int32(fx.block_idx.y) * rpt
 
         # Descriptor extents: bytes, i64 (see `_plane`).  One pinned descriptor
         # per plane, built here and not inside any branch.  `ks_bytes(num_pages)`
@@ -478,83 +538,163 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
         ks_rsrc = _plane(KS, ks_bytes(num_pages))
 
-        # --- row metadata: visible count (identical to the golden's visible_groups)
-        req = _ld_i32(t2r_rsrc, row * 4)
-        req_ok = (req >= 0) & (req < num_requests)
-        safe_req = req_ok.select(req, 0)
-        ctx = _ld_i32(cl_rsrc, safe_req * 4)
-        pos = _ld_i32(qp_rsrc, row * 4)
-        # min is monotone, so min(a, b) // 4 == min(a // 4, b // 4); clamping to
-        # >= 0 first keeps the division on a non-negative operand.
-        head = _imax(_imin(pos + 1, ctx), 0)
-        vis = head // PAGE_SIZE
-        vis = req_ok.select(vis, 0)
+        # --- row metadata, one entry per row of the group.  `row_i` is clamped
+        # to the last row so that even a short last group only reads in-bounds
+        # metadata; its stores are predicated on `live_i` instead.
+        row_i, req_i, ok_i, sreq_i, vis_i, qb_i, live_i = [], [], [], [], [], [], []
+        for i in range_constexpr(rpt):
+            r_i = _imin(row0 + i, rows - 1)
+            row_i.append(r_i)
+            live_i.append((row0 + i) < rows)
+            req = _ld_i32(t2r_rsrc, r_i * 4)
+            ok = (req >= 0) & (req < num_requests)
+            req_i.append(req)
+            ok_i.append(ok)
+            sreq_i.append(ok.select(req, 0))
+            ctx = _ld_i32(cl_rsrc, sreq_i[i] * 4)
+            pos = _ld_i32(qp_rsrc, r_i * 4)
+            # min is monotone, so min(a, b) // 4 == min(a // 4, b // 4); clamping
+            # to >= 0 first keeps the division on a non-negative operand.
+            head = _imax(_imin(pos + 1, ctx), 0)
+            vis_i.append(ok.select(head // PAGE_SIZE, 0))
+            qb_i.append(r_i * per_page * 2)
 
         # One thread per row writes the row metadata.  Predicated (not sentinel-
         # masked): the store address `row * 4` is in bounds for *every* thread
         # that reaches it, so an un-taken branch can never fault.
-        writer = (tid == 0) & (ptile == 0) & (row < rows)
-        if writer:
-            _st_i32(vis_rsrc, row * 4, vis)
-            _st_i32(rst_rsrc, row * 4, fx.Int32(0))
+        writer = (tid == 0) & (ptile == 0)
+        for i in range_constexpr(rpt):
+            if writer & live_i[i]:
+                _st_i32(vis_rsrc, row_i[i] * 4, vis_i[i])
+                _st_i32(rst_rsrc, row_i[i] * 4, fx.Int32(0))
 
-        # --- page -> physical page (one lookup, four columns share it)
+        # --- page -> physical page (one lookup per *request* in the group)
         logical_ok = page < width
         safe_logical = logical_ok.select(page, 0)
-        phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
-        page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-        phys = page_ok.select(phys, 0)
 
-        # --- score: sum_h relu(q[t,h,:] . k[c]) / sqrt(128), PAGE_SIZE columns at
-        # a time.  Per 8-dim step the thread issues the four key chunks (one per
-        # column, 16 B / 8 B each) and *one* Q chunk per head, then does the
-        # 4 columns x 4 heads x 8 dims FMAs: 8 loads per 128 FMAs, where v0 needed
-        # 20 loads per 32 FMAs.  The accumulation order is unchanged from v0
-        # (step, then in-step dim, then head) so the results are bit-identical.
-        q_base = row * per_page * 2
-        k_base = phys * page_bytes
+        def _page_of(i):
+            """(page_ok, phys) of row i: clamped page index and physical page."""
+            phys = _ld_i32(pt_rsrc, (sreq_i[i] * width + safe_logical) * 4)
+            ok = ok_i[i] & logical_ok & (phys >= 0) & (phys < num_pages)
+            return ok, ok.select(phys, 0)
+
         zero = fx.Float32(0.0)
-        acc = []
-        for j in range_constexpr(PAGE_SIZE):
-            acc.append([zero, zero, zero, zero])
-        for s in range_constexpr(steps):
-            kv = []
+        neg_inf = fx.Float32(_NEG_INF)
+
+        def _emit_cols(i, pok, phys, acc, scales=None):
+            """The PAGE_SIZE output columns of row i from its accumulators."""
             for j in range_constexpr(PAGE_SIZE):
-                kraw = _ld_vec(kv_rsrc, k_base + j * key_row_bytes + s * k_bytes,
-                               k_dwords, fx.Int32)
-                kv.append(key_vals(kraw))
-            for h in range_constexpr(NUM_HEADS):
-                qraw = _ld_vec(q_rsrc, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32)
-                qs = _q_vals(qraw)
+                col = col0 + j
+                if scales is None:
+                    scale = scale_of(ks_rsrc, phys, fx.Int32(j))
+                else:
+                    scale = scales[j]
+                total = (
+                    (acc[j][0] * scale).maximumf(zero)
+                    + (acc[j][1] * scale).maximumf(zero)
+                    + (acc[j][2] * scale).maximumf(zero)
+                    + (acc[j][3] * scale).maximumf(zero)
+                )
+                total = total * inv_divisor
+
+                keep = pok & (col < vis_i[i])
+                value = keep.select(total, neg_inf)
+                # Predicated store, per (row, column): a column tail inside the
+                # last page (`col >= columns`) and a row past the end of the last
+                # group (`live_i[i]` false) write nothing, so the address is
+                # always inside [0, rows * columns * 4).  It is clamped as well,
+                # so even a mis-lowered predicate degrades to one corrupted
+                # element (the last column of the last row) instead of an
+                # out-of-buffer access.  v0 instead stored at the constant byte
+                # offset 0x7FFFFFFF, which relies on the V# bounds check actually
+                # being armed; the d07-2 VM_PAGE_FAULT (page start
+                # 0x16bf5fff000 == a 2 MiB-aligned base + 0x7FFFFFFF) says it was
+                # not.  Do not reintroduce that pattern.
+                out_idx = _imin(row_i[i] * columns + col, rows * columns - 1)
+                if live_i[i] & (col < columns):
+                    _st_f32(logits_rsrc, out_idx * 4, value)
+
+        def _emit_one_row(i):
+            """rpt == 1 body, and the per-row fallback: row i with its own page.
+
+            Per 8-dim step: the four key chunks (one per column of the page) and
+            one Q chunk per head, then 4 columns x 4 heads x 8 dims = 128 FMAs.
+            The accumulation order (step, in-step dim, head) is exactly v0's, so
+            the results are bit-identical.
+            """
+            pok, phys = _page_of(i)
+            acc = []
+            for j in range_constexpr(PAGE_SIZE):
+                acc.append([zero, zero, zero, zero])
+            for s in range_constexpr(steps):
+                kv = []
                 for j in range_constexpr(PAGE_SIZE):
-                    for d in range_constexpr(DIM_PER_STEP):
-                        acc[j][h] = acc[j][h] + qs[d] * kv[j][d]
+                    kraw = _ld_vec(kv_rsrc, phys * page_bytes + j * key_row_bytes
+                                   + s * k_bytes, k_dwords, fx.Int32)
+                    kv.append(key_vals(kraw))
+                for h in range_constexpr(NUM_HEADS):
+                    qraw = _ld_vec(q_rsrc, qb_i[i] + h * (HEAD_DIM * 2) + s * 16,
+                                   4, fx.Int32)
+                    qs = _q_vals(qraw)
+                    for j in range_constexpr(PAGE_SIZE):
+                        for d in range_constexpr(DIM_PER_STEP):
+                            acc[j][h] = acc[j][h] + qs[d] * kv[j][d]
+            _emit_cols(i, pok, phys, acc)
 
-        for j in range_constexpr(PAGE_SIZE):
-            col = col0 + j
-            scale = scale_of(ks_rsrc, phys, fx.Int32(j))
-            total = (
-                (acc[j][0] * scale).maximumf(zero)
-                + (acc[j][1] * scale).maximumf(zero)
-                + (acc[j][2] * scale).maximumf(zero)
-                + (acc[j][3] * scale).maximumf(zero)
-            )
-            total = total * inv_divisor
+        def _emit_shared_rows():
+            """Fast path: the whole group shares one request (hence one page).
 
-            keep = page_ok & (col < vis)
-            value = keep.select(total, fx.Float32(_NEG_INF))
-            # Predicated store, per column: a column tail inside the last page
-            # (`col >= columns`) writes nothing, so the address is always inside
-            # [0, rows * columns * 4).  It is clamped as well, so even a
-            # mis-lowered predicate degrades to one corrupted element (the last
-            # column of the last row) instead of an out-of-buffer access.  v0
-            # instead stored at the constant byte offset 0x7FFFFFFF, which relies
-            # on the V# bounds check actually being armed; the d07-2 VM_PAGE_FAULT
-            # (page start 0x16bf5fff000 == a 2 MiB-aligned base + 0x7FFFFFFF) says
-            # it was not.  Do not reintroduce that pattern.
-            out_idx = _imin(row * columns + col, rows * columns - 1)
-            if col < columns:
-                _st_f32(logits_rsrc, out_idx * 4, value)
+            The key chunks of a step are loaded and decoded **once** and reused
+            by all `rpt` rows, so the e4m3 software decode (and the key traffic)
+            is amortised over the group.  Q stays per row, which is the only
+            per-row load left.
+            """
+            pok, phys = _page_of(0)          # all rows share this request
+            acc = []
+            for i in range_constexpr(rpt):
+                row_acc = []
+                for j in range_constexpr(PAGE_SIZE):
+                    row_acc.append([zero, zero, zero, zero])
+                acc.append(row_acc)
+            scales = []
+            for j in range_constexpr(PAGE_SIZE):
+                scales.append(scale_of(ks_rsrc, phys, fx.Int32(j)))
+            for s in range_constexpr(steps):
+                kv = []
+                for j in range_constexpr(PAGE_SIZE):
+                    kraw = _ld_vec(kv_rsrc, phys * page_bytes + j * key_row_bytes
+                                   + s * k_bytes, k_dwords, fx.Int32)
+                    kv.append(key_vals(kraw))
+                for i in range_constexpr(rpt):
+                    for h in range_constexpr(NUM_HEADS):
+                        qraw = _ld_vec(q_rsrc, qb_i[i] + h * (HEAD_DIM * 2) + s * 16,
+                                       4, fx.Int32)
+                        qs = _q_vals(qraw)
+                        for j in range_constexpr(PAGE_SIZE):
+                            for d in range_constexpr(DIM_PER_STEP):
+                                acc[i][j][h] = acc[i][j][h] + qs[d] * kv[j][d]
+            for i in range_constexpr(rpt):
+                _emit_cols(i, pok, phys, acc[i], scales)
+
+        if rpt == 1:
+            # Build-time single path: identical code to the page-per-thread v1
+            # body (no run-time branch, no duplicated body).
+            _emit_one_row(0)
+        else:
+            # Workgroup-uniform condition: every lane of the block sees the same
+            # token_to_request values, so this branch never diverges.  The two
+            # paths are emitted as separate traced regions and each one computes
+            # and stores its own results, so no value has to escape a region.
+            same_req = req_i[0] == req_i[1]
+            diff_req = req_i[0] != req_i[1]
+            for i in range(2, rpt):
+                same_req = same_req & (req_i[0] == req_i[i])
+                diff_req = diff_req & (req_i[0] != req_i[i])
+            if same_req:
+                _emit_shared_rows()
+            if diff_req:
+                for i in range_constexpr(rpt):
+                    _emit_one_row(i)
 
     @flyc.jit
     def launch(
@@ -581,7 +721,8 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
             Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
             rows, columns, num_pages, num_requests, width,
         ).launch(
-            grid=(fx.Int64(grid_x), fx.Int64(rows), 1),
+            # grid.y covers the row *groups* (rpt rows each), grid.x the pages.
+            grid=(fx.Int64(grid_x), fx.Int64(_grid_y(rows, rpt)), 1),
             block=(threads, 1, 1),
             stream=stream,
         )
@@ -831,7 +972,26 @@ def qsa_paged_mqa_logits_page4(
     # [0, num_pages) before any cache/scale access.
     grid_x = _grid_x(columns, threads)
 
-    launcher = _build_kernel(is_fp8, threads, float(divisor))
+    # Row grouping (see `_build_kernel`): `rpt` consecutive rows per thread share
+    # one page's key loads and one e4m3 decode when they belong to the same
+    # request.  `rpt` is chosen from *host shape scalars only* -- the average
+    # rows per request -- never from device data, so it needs no sync:
+    #   * decode (4 rows/request)  -> rpt 4
+    #   * prefill (256 rows/request) -> rpt 4
+    #   * draft  (1 row/request)   -> rpt 1: nothing to share, keep the
+    #                                 single-row kernel and its 4x larger grid.
+    # bf16 keeps rpt 1: it has no decode to amortise, so grouping would only
+    # trade K loads (16 -> 16/rpt per output) for a much larger accumulator set.
+    rpt = 1
+    if is_fp8 and num_requests >= 1:
+        per_req = rows // num_requests
+        if per_req >= RPT_MAX:
+            rpt = RPT_MAX
+        elif per_req >= 2:
+            rpt = 2
+        rpt = min(rpt, _grid_y(rows, 1))          # never more groups than rows
+
+    launcher = _build_kernel(is_fp8, threads, float(divisor), rpt)
     kv_u8 = compressed_k_cache.view(torch.uint8).view(num_pages, -1)
     q_u8 = q.view(torch.uint8).view(rows, -1)
     ks = compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else _dummy_scale(dev)

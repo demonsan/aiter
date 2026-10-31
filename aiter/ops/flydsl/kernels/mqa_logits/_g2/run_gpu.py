@@ -77,6 +77,17 @@ def patch(data, what):
         # (clamp_min(0) only), so this case is checked against the contract
         # (invalid page -> -inf) instead of against the golden.
         d["page_table"][0, 0] = 1 << 24
+    elif what == "t2r_straddle":
+        # Every row group of the row-grouped kernel (rows_per_thread > 1) straddles
+        # requests, so the kernel must take its per-row *fallback* path.  Without
+        # this case the fallback is never dispatched on the GPU (the standard
+        # fixtures are request-contiguous), and the two paths are separate traced
+        # regions, so both need real coverage.
+        n = max(1, int(d["context_lens"].numel()))
+        d["token_to_request"] = (
+            torch.arange(d["token_to_request"].numel(),
+                         device=d["token_to_request"].device, dtype=torch.int64) % n
+        ).to(torch.int32)
     elif what == "short_ctx":
         d["context_lens"][0] = 8
     else:
@@ -223,6 +234,12 @@ def correctness():
                                         table_width=16, cache_pages=64, patch="visible_zero")),
         ("edge_t2r_invalid_bf16", dict(regime="decode", rows=4, requests=1, fmt="bf16",
                                        table_width=16, cache_pages=64, patch="t2r_invalid")),
+        # row-grouped fp8 fallback path: rows of one group belong to different
+        # requests, so the workgroup-uniform `same_req` guard must send every
+        # group to the per-row path (see the module docstring's round-A section).
+        ("edge_t2r_straddle_fp8", dict(regime="decode", rows=16, requests=4, fmt="fp8",
+                                       table_width=16, cache_pages=64,
+                                       patch="t2r_straddle")),
         ("edge_bad_page_bf16", dict(regime="decode", rows=4, requests=1, fmt="bf16",
                                     table_width=16, cache_pages=64, patch="bad_page")),
         ("edge_bad_page_fp8", dict(regime="decode", rows=4, requests=1, fmt="fp8",

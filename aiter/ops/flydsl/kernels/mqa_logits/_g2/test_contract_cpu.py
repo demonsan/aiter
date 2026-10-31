@@ -146,6 +146,94 @@ def emulate_page4_v1(q, cache, scale, table, t2r, qpos, ctx, max_columns=None,
 
 
 
+def emulate_page4_v2(q, cache, scale, table, t2r, qpos, ctx, max_columns=None,
+                     threads=256, rpt=1, force_shared=False):
+    """Mirror of the **row-grouped** kernel (v1 + ``rows_per_thread = rpt``).
+
+    ``grid.y = ceil(rows / rpt)``, ``row0 = blockIdx.y * rpt``, and a thread owns
+    one page (four consecutive columns) for its whole row group.  The kernel
+    picks one of two paths on a workgroup-uniform condition:
+
+    * ``force_shared=True``  -- the **fast path**: every row of the group takes
+      its page from row ``row0`` (valid only when the group shares one request);
+    * ``force_shared=False`` -- the **fallback**: each row does its own page-table
+      lookup and page, which is what the kernel does when the group straddles
+      requests (and what ``rpt == 1`` always does).
+
+    Returns ``(out, vis, groups_uniform)`` where ``groups_uniform`` reports
+    whether *every* group of this call had a single ``token_to_request`` value --
+    i.e. whether the real kernel would have taken the fast path.  The two paths
+    must agree bitwise whenever ``groups_uniform`` is true.
+    """
+    rows = q.shape[0]
+    num_pages, P, _, D = cache.shape
+    assert P == PAGE and D == HDIM
+    num_requests, width = table.shape
+    columns = width * PAGE if max_columns is None else max(1, min(width * PAGE, int(max_columns)))
+    is_fp8 = cache.dtype == torch.float8_e4m3fn
+    pages = (columns + PAGE - 1) // PAGE
+    ptiles = max(1, (pages + threads - 1) // threads)
+    row_groups = max(1, (rows + rpt - 1) // rpt)
+
+    keys = cache.to(torch.float32)
+    out = torch.full((rows, columns), float("-inf"), dtype=torch.float32)
+    vis_out = torch.zeros(rows, dtype=torch.int32)
+    groups_uniform = True
+    for g in range(row_groups):
+        row0 = g * rpt
+        group = [r for r in range(row0, min(row0 + rpt, rows))]
+        reqs = {int(t2r[r]) for r in group}
+        if len(reqs) != 1:
+            groups_uniform = False
+        for row in group:
+            req = int(t2r[row])
+            req_ok = 0 <= req < num_requests
+            safe_req = req if req_ok else 0
+            cl = int(ctx[safe_req])
+            pos = int(qpos[row])
+            head = max(min(pos + 1, cl), 0)
+            vis = head // PAGE
+            vis = vis if req_ok else 0
+            vis_out[row] = vis
+        for ptile in range(ptiles):
+            for tid in range(threads):
+                page = ptile * threads + tid
+                col0 = page * PAGE
+                logical_ok = page < width
+                safe_logical = page if logical_ok else 0
+                # page table of the *shared* (row0) request on the fast path
+                shared_req = int(t2r[row0])
+                shared_ok = 0 <= shared_req < num_requests
+                shared_phys = int(table[shared_req if shared_ok else 0, safe_logical])
+                shared_page_ok = shared_ok and logical_ok and 0 <= shared_phys < num_pages
+                for row in group:
+                    req = int(t2r[row])
+                    req_ok = 0 <= req < num_requests
+                    safe_req = req if req_ok else 0
+                    if force_shared:
+                        phys = shared_phys if shared_page_ok else 0
+                        page_ok = shared_page_ok
+                    else:
+                        phys = int(table[safe_req, safe_logical])
+                        page_ok = req_ok and logical_ok and 0 <= phys < num_pages
+                        phys = phys if page_ok else 0
+                    vis = int(vis_out[row])
+                    for j in range(PAGE):
+                        col = col0 + j
+                        if col >= columns:
+                            continue                      # predicated store
+                        acc = torch.zeros(HEADS, dtype=torch.float32)
+                        for h in range(HEADS):
+                            acc[h] = torch.dot(q[row, h, :].to(torch.float32),
+                                               keys[phys, j, 0, :])
+                        if is_fp8:
+                            acc = acc * float(scale[phys, j, 0])
+                        total = torch.clamp_min(acc, 0.0).sum() / math.sqrt(HDIM)
+                        keep = page_ok and col < vis
+                        out[row, col] = total if keep else float("-inf")
+    return out, vis_out, groups_uniform
+
+
 def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
               max_columns=None, patch=None, seed=0, verbose=True, mapping="v1"):
     # max_ctx = 16 * table_width fills the page table (needed_per_req == width) and
@@ -349,7 +437,97 @@ def main() -> int:
               % ("PASS" if same else "FAIL", name, rows, cols, fmt, same))
         fails += 0 if same else 1
 
+    print("== row-group path (rows_per_thread = 2/4): fast path, fallback, guard ==")
+    # The kernel groups `rpt` consecutive rows per thread and takes its *fast*
+    # path (one page-table lookup + one K load/decode per page, reused by the
+    # whole group) only when the group shares one token_to_request -- a
+    # workgroup-uniform condition.  These cases prove, on the CPU:
+    #   (a) with the standard fixtures every group IS uniform, and the fast-path
+    #       emulation is bitwise identical to the per-row (fallback) one and to
+    #       the golden;
+    #   (b) with a deliberately straddling row->request map the guard reports
+    #       non-uniform, the fast path *would* be wrong (so the guard is
+    #       load-bearing) and the fallback is still exact.
+    def _v2_case(tag, regime, rows, requests, fmt, tw, cp, mc, rpt, patch=None,
+                 expect_uniform=True):
+        nonlocal fails
+        data, meta, cols = _case_fixture(regime, rows, requests, fmt, tw, cp, mc,
+                                        patch, 0)
+        t2r, qpos, ctx, table = meta
+        gold, gold_vis, valid = G.reference_logits(
+            data["q"], data["compressed_k_cache"], table, t2r, qpos, ctx,
+            compress_ratio=S.COMPRESS_RATIO, max_columns=cols,
+            compressed_k_scale=data["compressed_k_scale"])
+        slow = emulate_page4_v2(data["q"], data["compressed_k_cache"],
+                                data["compressed_k_scale"], table, t2r, qpos, ctx,
+                                max_columns=cols, rpt=rpt, force_shared=False)
+        fast = emulate_page4_v2(data["q"], data["compressed_k_cache"],
+                                data["compressed_k_scale"], table, t2r, qpos, ctx,
+                                max_columns=cols, rpt=rpt, force_shared=True)
+        res_slow = G.compare_logits(slow[0], slow[1], gold, gold_vis, valid)
+        res_fast = G.compare_logits(fast[0], fast[1], gold, gold_vis, valid)
+        uniform = slow[2]
+        same = bool(torch.equal(slow[0], fast[0]) and torch.equal(slow[1], fast[1]))
+        if expect_uniform:
+            # uniform group -> the kernel takes the fast path -> it must be exact
+            ok = (uniform and same and bool(res_fast.get("pass"))
+                  and bool(res_slow.get("pass")))
+        else:
+            # mixed group -> the guard must fire and the fallback must be exact
+            ok = (not uniform) and bool(res_slow.get("pass"))
+        print("[%s] %-26s rpt=%d rows=%3d cols=%5d %-4s uniform=%-5s "
+              "fallback_bad=%d fastpath_bad=%d fast==fallback=%s"
+              % ("PASS" if ok else "FAIL", tag, rpt, rows, cols, fmt, uniform,
+                 res_slow.get("bad", -1), res_fast.get("bad", -1), same))
+        fails += 0 if ok else 1
+
+    for rpt in (2, 4):
+        for tag, regime, rows, requests, fmt, tw, cp, mc in [
+            ("v2_decode4", "decode", 4, 1, "fp8", 16, 32, None),
+            ("v2_decode16", "decode", 16, 4, "fp8", 16, 64, None),
+            ("v2_tail_257", "prefill", 8, 1, "bf16", 65, 256, 257),
+        ]:
+            _v2_case(tag, regime, rows, requests, fmt, tw, cp, mc, rpt)
+        # draft shape: 1 row per request -> every group straddles requests, so the
+        # kernel keeps rpt = 1 (the wrapper picks it from rows/num_requests); the
+        # emulator is asked to group anyway, to prove the fallback is exact.
+        _v2_case("v2_draft_straddle", "draft", 8, 8, "fp8", 16, 256, None, rpt,
+                 expect_uniform=False)
+
+    # (b) straddling rows: request ids interleaved so every group of 4 spans four
+    # requests.  The guard must fire, the fast path must be wrong, the fallback
+    # must be exact.  This is the exact shape of the harness's `t2r_invalid`
+    # edge-case family (rows with different/absent requests in one group).
+    def patch_interleaved(t2r, qpos, ctx, table):
+        for r in range(t2r.numel()):
+            t2r[r] = r % max(1, min(4, ctx.numel()))
+        return t2r, qpos, ctx, table
+    for rpt in (2, 4):
+        data, meta, cols = _case_fixture("prefill", 8, 4, "fp8", 16, 64, None,
+                                        patch_interleaved, 0)
+        t2r, qpos, ctx, table = meta
+        gold, gold_vis, valid = G.reference_logits(
+            data["q"], data["compressed_k_cache"], table, t2r, qpos, ctx,
+            compress_ratio=S.COMPRESS_RATIO, max_columns=cols,
+            compressed_k_scale=data["compressed_k_scale"])
+        slow = emulate_page4_v2(data["q"], data["compressed_k_cache"],
+                                data["compressed_k_scale"], table, t2r, qpos, ctx,
+                                max_columns=cols, rpt=rpt, force_shared=False)
+        fast = emulate_page4_v2(data["q"], data["compressed_k_cache"],
+                                data["compressed_k_scale"], table, t2r, qpos, ctx,
+                                max_columns=cols, rpt=rpt, force_shared=True)
+        res_slow = G.compare_logits(slow[0], slow[1], gold, gold_vis, valid)
+        guard_fires = not slow[2]
+        fast_wrong = not bool(torch.equal(slow[0], fast[0]))
+        ok = guard_fires and fast_wrong and bool(res_slow.get("pass"))
+        print("[%s] %-26s rpt=%d rows=%3d cols=%5d %-4s guard_fires=%s "
+              "fastpath_would_be_wrong=%s fallback_bad=%d"
+              % ("PASS" if ok else "FAIL", "v2_straddle_guard", rpt, 8, cols, "fp8",
+                 guard_fires, fast_wrong, res_slow.get("bad", -1)))
+        fails += 0 if ok else 1
+
     print("== edge cases ==")
+
     def patch_vis0(t2r, qpos, ctx, table):          # visible == 0 rows
         qpos[0] = 2
         qpos[1] = 0

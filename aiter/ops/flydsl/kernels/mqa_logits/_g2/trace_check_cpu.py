@@ -327,10 +327,10 @@ def _kernel_body(launch):
     raise RuntimeError("kernel body not found in _build_kernel's closure")
 
 
-def trace_one(mod, is_fp8, threads=THREADS, divisor=128 ** 0.5, shape=None):
+def trace_one(mod, is_fp8, threads=THREADS, divisor=128 ** 0.5, shape=None, rpt=1):
     shape = dict(SHAPE if shape is None else shape)
     COUNT.n.clear()
-    launcher = mod._build_kernel(is_fp8, threads, float(divisor))
+    launcher = mod._build_kernel(is_fp8, threads, float(divisor), rpt)
     body = _kernel_body(launcher)
     args = [Val("tensor") for _ in range(10)]
     args += [Val("kernarg") for _ in range(5)]
@@ -338,6 +338,7 @@ def trace_one(mod, is_fp8, threads=THREADS, divisor=128 ** 0.5, shape=None):
     census = COUNT.as_dict()
     return {
         "dtype": "fp8" if is_fp8 else "bf16",
+        "rpt": int(rpt),
         "kernel_name": launcher.kernel_name,
         "ops": census,
         "loads": census.get("load", 0),
@@ -351,8 +352,11 @@ def trace_one(mod, is_fp8, threads=THREADS, divisor=128 ** 0.5, shape=None):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", default=KERNEL_PATH)
+    ap.add_argument("--rpt", default="1,2,4",
+                    help="comma-separated rows-per-thread values to trace")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
+    rpts = [int(x) for x in str(args.rpt).split(",") if x.strip()]
 
     installed = _make_mock()
     sys.modules.update(installed)
@@ -365,22 +369,25 @@ def main(argv=None) -> int:
         out = {"kernel": args.kernel, "specializations": []}
         rc = 0
         for is_fp8 in (False, True):
-            try:
-                rec = trace_one(mod, is_fp8)
-                out["specializations"].append(rec)
-                print("[TRACED] %-4s %s" % (rec["dtype"], rec["kernel_name"]))
-                print("         loads=%d stores=%d mul+add=%d nodes=%d"
-                      % (rec["loads"], rec["stores"], rec["fma_like"],
-                         rec["total_nodes"]))
-                print("         census: " + json.dumps(rec["ops"]))
-            except Exception as exc:  # noqa: BLE001
-                rc = 1
-                import traceback
-                traceback.print_exc()
-                print("[FAILED] %s: %s"
-                      % ("fp8" if is_fp8 else "bf16", exc))
-                out["specializations"].append(
-                    {"dtype": "fp8" if is_fp8 else "bf16", "error": str(exc)})
+            for rpt in rpts:
+                try:
+                    rec = trace_one(mod, is_fp8, rpt=rpt)
+                    out["specializations"].append(rec)
+                    print("[TRACED] %-4s rpt=%d %s"
+                          % (rec["dtype"], rec["rpt"], rec["kernel_name"]))
+                    print("         loads=%d stores=%d mul+add=%d nodes=%d"
+                          % (rec["loads"], rec["stores"], rec["fma_like"],
+                             rec["total_nodes"]))
+                    print("         census: " + json.dumps(rec["ops"]))
+                except Exception as exc:  # noqa: BLE001
+                    rc = 1
+                    import traceback
+                    traceback.print_exc()
+                    print("[FAILED] %s rpt=%d: %s"
+                          % ("fp8" if is_fp8 else "bf16", rpt, exc))
+                    out["specializations"].append(
+                        {"dtype": "fp8" if is_fp8 else "bf16", "rpt": rpt,
+                         "error": str(exc)})
         print("\ntrace check: %s" % ("PASS" if rc == 0 else "FAIL"))
     finally:
         for name in installed:

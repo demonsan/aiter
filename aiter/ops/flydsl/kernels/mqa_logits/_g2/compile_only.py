@@ -42,7 +42,8 @@ def main() -> int:
     logits = torch.zeros(rows * columns, dtype=torch.float32)
     vis = torch.zeros(rows, dtype=torch.int32)
     rst = torch.zeros(rows, dtype=torch.int32)
-    grid_x = (columns + K.THREADS - 1) // K.THREADS
+    # one thread per compressed page (v1): the column grid covers ceil(columns/4)
+    grid_x = K._grid_x(columns, K.THREADS)
     out = {"module": how, "specializations": []}
     rc = 0
     for is_fp8 in (False, True):

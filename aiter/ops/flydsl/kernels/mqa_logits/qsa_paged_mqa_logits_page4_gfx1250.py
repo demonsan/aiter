@@ -82,6 +82,34 @@ behind ``QSA_G2_ACCESS=cop`` for the bisect ladder
 (``_g2/bisect.py`` / ``_g2/BISECT.md``) and as a one-variable revert.  Nothing
 observable at the op boundary changes: same planes, same extents, same byte
 addresses, same predicates, same values.
+
+Optimization round A (``v1``): **one thread per compressed page, not per column**.
+v0 was one thread per output element, so every thread re-read its whole ``q``
+row (1 KiB per output: 64 of its 80 ``buffer_load_dwordx4`` are Q) and every
+thread re-read the same page-table entry as its three page-mates.  A page is
+four *consecutive* columns with one page-table entry, one physical page and one
+fixed 1 KiB (bf16) / 512 B (fp8) block, so a thread that owns a whole page
+loads, per 8-dim step, the four key chunks *and* one Q chunk per head and
+computes 16 accumulators (4 columns x 4 heads) from them:
+
+    per 8-dim step, per page:  4 K loads + 4 Q loads for 128 FMAs
+    v0  per 8-dim step, per column: 1 K load + 4 Q loads for 32 FMAs
+
+i.e. 32 loads per output instead of 80, one page-table load instead of four,
+one ``visible``/request/``pos`` computation per page, and a grid that is four
+times smaller.  Q is the dominant load term in v0 (64 of the 80 loads), so this
+is the single largest instruction-count reduction available without changing the
+access layer: the per-load "readfirstlane + cmpx + exec narrowing" sequence
+FlyDSL emits for every ``buffer_load`` (see ``records/g2/isa/``) is paid 32 times
+per output instead of 80.
+
+Nothing else changes: same planes, same descriptor extents, same byte
+addresses, same clamps, same predicates, **same arithmetic order** (the 16 steps,
+the 8 in-step FMAs and the four ``relu`` terms are accumulated in exactly the
+same sequence, so results are bit-identical to v0), and every store is still
+predicated *and* clamped.  ``columns % 4 != 0`` is handled per column: the
+thread still loads its whole page (all addresses stay inside the cache, the page
+index is clamped) and stores only the columns that exist.
 """
 
 from __future__ import annotations
@@ -101,7 +129,7 @@ PAGE_SIZE = 4          # compressed rows per index-cache page (= KV block 16 / r
 NUM_HEADS = 4          # index heads
 HEAD_DIM = 128         # index head dim
 DIM_PER_STEP = 8       # head dims consumed per unrolled step (16 B of Q)
-THREADS = 256          # one thread per output column
+THREADS = 256          # threads per workgroup (one thread per compressed page)
 MAX_GRID_Y = 65535
 _NEG_INF = float("-inf")
 # A V# with num_records == 0 is *unbounded* (no bounds check at all), so every
@@ -333,6 +361,18 @@ def _e4m3_byte_to_f32(b):
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
+def _grid_x(columns: int, threads: int = THREADS) -> int:
+    """grid.x for the page-per-thread mapping: ``ceil(ceil(columns/4)/threads)``.
+
+    One thread owns one compressed page (``PAGE_SIZE`` consecutive columns), so
+    the grid must cover every *page* of the column range.  ``columns`` is at most
+    ``width * PAGE_SIZE``, so the page count never exceeds ``width`` (the
+    page-table width) and ``page < width`` holds for every launched thread.
+    """
+    pages = (int(columns) + PAGE_SIZE - 1) // PAGE_SIZE
+    return max(1, (pages + int(threads) - 1) // int(threads))
+
+
 @lru_cache(maxsize=None)
 def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     """One specialization per (dtype, block size, score divisor)."""
@@ -347,7 +387,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     dtype_tag = "fp8" if is_fp8 else "bf16"
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtype_tag}"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_flydsl"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_pg4_flydsl"
     )
 
     # The kernel body must not branch on this flag: an `if` over a closure
@@ -369,6 +409,15 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
             for sh in range_constexpr(4):
                 # byte 0 = dim 4j+0 ... byte 3 = dim 4j+3 (little endian)
                 vals.append(_e4m3_byte_to_f32((dw >> (8 * sh)) & fx.Int32(0xFF)))
+        return vals
+
+    def _q_vals(qraw):
+        """Eight bf16 Q values of one 16-byte chunk (2 per dword, little endian)."""
+        vals = []
+        for j in range_constexpr(4):
+            dw = fx.Int32(qraw[j])
+            vals.append((dw << 16).bitcast(fx.Float32))
+            vals.append(((dw >> 16) << 16).bitcast(fx.Float32))
         return vals
 
     def _ks_bytes_fp8(num_pages):
@@ -409,7 +458,11 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         tid = fx.Int32(fx.thread_idx.x)
         row = fx.Int32(fx.block_idx.y)
         ptile = fx.Int32(fx.block_idx.x)
-        col = ptile * threads + tid
+        # One thread per compressed page: the page is PAGE_SIZE *consecutive*
+        # columns that share one page-table entry and one physical page block,
+        # so `page` is both the logical page index and the column-block index.
+        page = ptile * threads + tid
+        col0 = page * PAGE_SIZE
 
         # Descriptor extents: bytes, i64 (see `_plane`).  One pinned descriptor
         # per plane, built here and not inside any branch.  `ks_bytes(num_pages)`
@@ -445,56 +498,63 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
             _st_i32(vis_rsrc, row * 4, vis)
             _st_i32(rst_rsrc, row * 4, fx.Int32(0))
 
-        # --- column -> (logical page, row in page)
-        col_ok = col < columns
-        logical = col // PAGE_SIZE
-        off = col % PAGE_SIZE
-        logical_ok = logical < width
-        safe_logical = logical_ok.select(logical, 0)
+        # --- page -> physical page (one lookup, four columns share it)
+        logical_ok = page < width
+        safe_logical = logical_ok.select(page, 0)
         phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
         page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
         phys = page_ok.select(phys, 0)
 
-        # --- score: sum_h relu(q[t,h,:] . k[c]) / sqrt(128)
+        # --- score: sum_h relu(q[t,h,:] . k[c]) / sqrt(128), PAGE_SIZE columns at
+        # a time.  Per 8-dim step the thread issues the four key chunks (one per
+        # column, 16 B / 8 B each) and *one* Q chunk per head, then does the
+        # 4 columns x 4 heads x 8 dims FMAs: 8 loads per 128 FMAs, where v0 needed
+        # 20 loads per 32 FMAs.  The accumulation order is unchanged from v0
+        # (step, then in-step dim, then head) so the results are bit-identical.
         q_base = row * per_page * 2
-        k_base = phys * page_bytes + off * key_row_bytes
+        k_base = phys * page_bytes
         zero = fx.Float32(0.0)
-        acc = [zero, zero, zero, zero]
+        acc = []
+        for j in range_constexpr(PAGE_SIZE):
+            acc.append([zero, zero, zero, zero])
         for s in range_constexpr(steps):
-            kraw = _ld_vec(kv_rsrc, k_base + s * k_bytes, k_dwords, fx.Int32)
-            kv = key_vals(kraw)
+            kv = []
+            for j in range_constexpr(PAGE_SIZE):
+                kraw = _ld_vec(kv_rsrc, k_base + j * key_row_bytes + s * k_bytes,
+                               k_dwords, fx.Int32)
+                kv.append(key_vals(kraw))
             for h in range_constexpr(NUM_HEADS):
                 qraw = _ld_vec(q_rsrc, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32)
-                qs = []
-                for j in range_constexpr(4):
-                    dw = fx.Int32(qraw[j])
-                    qs.append((dw << 16).bitcast(fx.Float32))
-                    qs.append(((dw >> 16) << 16).bitcast(fx.Float32))
-                for d in range_constexpr(DIM_PER_STEP):
-                    acc[h] = acc[h] + qs[d] * kv[d]
+                qs = _q_vals(qraw)
+                for j in range_constexpr(PAGE_SIZE):
+                    for d in range_constexpr(DIM_PER_STEP):
+                        acc[j][h] = acc[j][h] + qs[d] * kv[j][d]
 
-        scale = scale_of(ks_rsrc, phys, off)
-        total = (
-            (acc[0] * scale).maximumf(zero)
-            + (acc[1] * scale).maximumf(zero)
-            + (acc[2] * scale).maximumf(zero)
-            + (acc[3] * scale).maximumf(zero)
-        )
-        total = total * inv_divisor
+        for j in range_constexpr(PAGE_SIZE):
+            col = col0 + j
+            scale = scale_of(ks_rsrc, phys, fx.Int32(j))
+            total = (
+                (acc[j][0] * scale).maximumf(zero)
+                + (acc[j][1] * scale).maximumf(zero)
+                + (acc[j][2] * scale).maximumf(zero)
+                + (acc[j][3] * scale).maximumf(zero)
+            )
+            total = total * inv_divisor
 
-        keep = page_ok & (col < vis)
-        value = keep.select(total, fx.Float32(_NEG_INF))
-        # Predicated store: the column tail (`col >= columns`) writes nothing, so
-        # the address is always inside [0, rows * columns * 4).  It is clamped as
-        # well, so even a mis-lowered predicate degrades to one corrupted element
-        # (the last column of the last row) instead of an out-of-buffer access.
-        # v0 instead stored at the constant byte offset 0x7FFFFFFF, which relies
-        # on the V# bounds check actually being armed; the d07-2 VM_PAGE_FAULT
-        # (page start 0x16bf5fff000 == a 2 MiB-aligned base + 0x7FFFFFFF) says it
-        # was not.  Do not reintroduce that pattern.
-        out_idx = _imin(row * columns + col, rows * columns - 1)
-        if col_ok:
-            _st_f32(logits_rsrc, out_idx * 4, value)
+            keep = page_ok & (col < vis)
+            value = keep.select(total, fx.Float32(_NEG_INF))
+            # Predicated store, per column: a column tail inside the last page
+            # (`col >= columns`) writes nothing, so the address is always inside
+            # [0, rows * columns * 4).  It is clamped as well, so even a
+            # mis-lowered predicate degrades to one corrupted element (the last
+            # column of the last row) instead of an out-of-buffer access.  v0
+            # instead stored at the constant byte offset 0x7FFFFFFF, which relies
+            # on the V# bounds check actually being armed; the d07-2 VM_PAGE_FAULT
+            # (page start 0x16bf5fff000 == a 2 MiB-aligned base + 0x7FFFFFFF) says
+            # it was not.  Do not reintroduce that pattern.
+            out_idx = _imin(row * columns + col, rows * columns - 1)
+            if col < columns:
+                _st_f32(logits_rsrc, out_idx * 4, value)
 
     @flyc.jit
     def launch(
@@ -764,7 +824,12 @@ def qsa_paged_mqa_logits_page4(
     if not math.isfinite(divisor) or divisor <= 0.0:
         raise ValueError(f"divisor must be finite and > 0, got {divisor}")
     threads = THREADS
-    grid_x = (columns + threads - 1) // threads
+    # One thread per compressed page (PAGE_SIZE consecutive columns), so the
+    # column grid must cover ceil(columns / PAGE_SIZE) pages.  Every launched
+    # thread still stays inside every plane: its page index is clamped to
+    # [0, width) before the page-table read and its physical page to
+    # [0, num_pages) before any cache/scale access.
+    grid_x = _grid_x(columns, threads)
 
     launcher = _build_kernel(is_fp8, threads, float(divisor))
     kv_u8 = compressed_k_cache.view(torch.uint8).view(num_pages, -1)

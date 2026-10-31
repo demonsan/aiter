@@ -81,8 +81,73 @@ def emulate_page4(q, cache, scale, table, t2r, qpos, ctx, max_columns=None):
     return out, vis_out
 
 
+def emulate_page4_v1(q, cache, scale, table, t2r, qpos, ctx, max_columns=None,
+                     threads=256):
+    """Same math, but **the v1 thread mapping**: one thread per compressed page.
+
+    Mirrors ``qsa_paged_mqa_logits_page4_gfx1250`` v1 exactly::
+
+        grid.x = ceil(ceil(columns / PAGE) / threads),  grid.y = rows
+        page   = blockIdx.x * threads + threadIdx.x
+        col(j) = PAGE * page + j                      for j in 0..PAGE-1
+
+    so it is the *structural* model of the kernel (which index is read with which
+    clamp, which column is stored under which predicate), unlike
+    :func:`emulate_page4`, which models the v0 column-per-thread mapping.  Every
+    address the kernel can form for these shapes is bounds-audited separately by
+    ``audit_addressing_cpu.py``; this function is the value oracle.
+    """
+    rows = q.shape[0]
+    num_pages, P, _, D = cache.shape
+    assert P == PAGE and D == HDIM
+    num_requests, width = table.shape
+    columns = width * PAGE if max_columns is None else max(1, min(width * PAGE, int(max_columns)))
+    is_fp8 = cache.dtype == torch.float8_e4m3fn
+    pages = (columns + PAGE - 1) // PAGE
+    ptiles = max(1, (pages + threads - 1) // threads)
+
+    keys = cache.to(torch.float32)
+    out = torch.full((rows, columns), float("-inf"), dtype=torch.float32)
+    vis_out = torch.zeros(rows, dtype=torch.int32)
+    for row in range(rows):
+        req = int(t2r[row])
+        req_ok = 0 <= req < num_requests
+        safe_req = req if req_ok else 0
+        cl = int(ctx[safe_req])
+        pos = int(qpos[row])
+        head = max(min(pos + 1, cl), 0)
+        vis = head // PAGE
+        vis = vis if req_ok else 0
+        vis_out[row] = vis
+        for ptile in range(ptiles):
+            for tid in range(threads):
+                page = ptile * threads + tid
+                col0 = page * PAGE
+                # one page-table lookup for the whole page (clamped page index)
+                logical_ok = page < width
+                safe_logical = page if logical_ok else 0
+                phys = int(table[safe_req, safe_logical])
+                page_ok = req_ok and logical_ok and 0 <= phys < num_pages
+                phys = phys if page_ok else 0
+                for j in range(PAGE):
+                    col = col0 + j
+                    if col >= columns:
+                        continue                      # predicated store
+                    acc = torch.zeros(HEADS, dtype=torch.float32)
+                    for h in range(HEADS):
+                        acc[h] = torch.dot(q[row, h, :].to(torch.float32),
+                                           keys[phys, j, 0, :])
+                    if is_fp8:
+                        acc = acc * float(scale[phys, j, 0])
+                    total = torch.clamp_min(acc, 0.0).sum() / math.sqrt(HDIM)
+                    keep = page_ok and col < vis
+                    out[row, col] = total if keep else float("-inf")
+    return out, vis_out
+
+
+
 def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
-              max_columns=None, patch=None, seed=0, verbose=True):
+              max_columns=None, patch=None, seed=0, verbose=True, mapping="v1"):
     # max_ctx = 16 * table_width fills the page table (needed_per_req == width) and
     # makes ctx//4 == columns, so the visible window covers every column.
     max_ctx = 16 * table_width
@@ -99,7 +164,8 @@ def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
         compress_ratio=S.COMPRESS_RATIO, max_columns=cols,
         compressed_k_scale=data["compressed_k_scale"],
     )
-    out, out_vis = emulate_page4(
+    emulator = emulate_page4 if mapping == "v0" else emulate_page4_v1
+    out, out_vis = emulator(
         data["q"], data["compressed_k_cache"], data["compressed_k_scale"], table, t2r, qpos, ctx,
         max_columns=cols,
     )
@@ -180,7 +246,7 @@ def _contract_only(name, regime, rows, requests, fmt, table_width, cache_pages,
         regime, rows, requests, fmt, table_width, cache_pages, max_columns, patch, seed)
     num_pages = int(data["compressed_k_cache"].shape[0])
     width = int(table.shape[1])
-    out, out_vis = emulate_page4(
+    out, out_vis = emulate_page4_v1(
         data["q"], data["compressed_k_cache"], data["compressed_k_scale"], table,
         t2r, qpos, ctx, max_columns=cols)
     vis_ref = G.visible_groups(t2r, qpos, ctx, compress_ratio=S.COMPRESS_RATIO)
@@ -222,7 +288,7 @@ def _scale_case(name, value, rows=4, requests=1, table_width=16, cache_pages=32)
         data["q"], data["compressed_k_cache"], data["page_table"], data["token_to_request"],
         data["query_positions"], data["context_lens"], compress_ratio=S.COMPRESS_RATIO,
         compressed_k_scale=data["compressed_k_scale"])
-    out, out_vis = emulate_page4(
+    out, out_vis = emulate_page4_v1(
         data["q"], data["compressed_k_cache"], data["compressed_k_scale"],
         data["page_table"], data["token_to_request"], data["query_positions"],
         data["context_lens"])
@@ -252,8 +318,36 @@ def main() -> int:
         ("tail_columns_1", "decode", 4, 1, "bf16", 16, 32, 1),
     ]
     for spec in specs:
-        ok, _ = _run_case(*spec)
-        fails += 0 if ok else 1
+        for mapping in ("v1", "v0"):
+            tagged = (spec[0] + "_" + mapping,) + spec[1:]
+            ok, _ = _run_case(*tagged, mapping=mapping)
+            fails += 0 if ok else 1
+
+    print("== v0 (column-per-thread) vs v1 (page-per-thread) mapping equivalence ==")
+    # The v1 kernel must compute exactly the same numbers as v0: same clamps, same
+    # accumulation order.  Both emulators are independent implementations of the
+    # two thread mappings, so bitwise equality of the whole [rows, columns] tensor
+    # (and of the visible_groups output) is the strongest CPU statement that the
+    # remapping did not move any value.
+    for name, regime, rows, requests, fmt, tw, cp, mc in [
+        ("eq_min_decode", "decode", 4, 1, "bf16", 16, 32, None),
+        ("eq_min_decode_fp8", "decode", 4, 1, "fp8", 16, 32, None),
+        ("eq_tail_257", "prefill", 4, 1, "bf16", 65, 256, 257),
+        ("eq_tail_1000_fp8", "prefill", 8, 2, "fp8", 256, 1024, 1000),
+        ("eq_draft8", "draft", 8, 8, "bf16", 16, 256, None),
+    ]:
+        data, meta, cols = _case_fixture(regime, rows, requests, fmt, tw, cp, mc, None, 0)
+        t2r, qpos, ctx, table = meta
+        a = emulate_page4(data["q"], data["compressed_k_cache"],
+                          data["compressed_k_scale"], table, t2r, qpos, ctx,
+                          max_columns=cols)
+        b = emulate_page4_v1(data["q"], data["compressed_k_cache"],
+                             data["compressed_k_scale"], table, t2r, qpos, ctx,
+                             max_columns=cols)
+        same = bool(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]))
+        print("[%s] %-26s rows=%3d cols=%5d %-4s bitwise_identical=%s"
+              % ("PASS" if same else "FAIL", name, rows, cols, fmt, same))
+        fails += 0 if same else 1
 
     print("== edge cases ==")
     def patch_vis0(t2r, qpos, ctx, table):          # visible == 0 rows

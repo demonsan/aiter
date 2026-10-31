@@ -8,11 +8,13 @@ a shape and checks it against the extent of the plane it belongs to.  It is the
 offline half of "this kernel cannot fault the device":
 
   * ``analytic`` — closed-form bounds.  Every address expression is monotone in
-    ``(row, col, phys, off, s)``, so its maximum over the whole domain is the
+    ``(row, page, phys, off, s)``, so its maximum over the whole domain is the
     expression evaluated at the domain corner; that covers *all* workgroups,
     not a sample.
-  * ``enumerate`` — per-column enumeration, including the tail lanes
-    ``col >= columns`` (exhaustive for small shapes; boundary columns over
+  * ``enumerate`` — per-page enumeration, including the tail lanes
+    ``page >= ceil(columns / 4)`` and the partial last page: a thread loads its
+    whole page even when only some of its four columns exist, and stores only
+    the columns that exist (exhaustive for small shapes; boundary pages over
     several rows for the big buckets).  Only stores whose predicate is true are
     counted, so the audited set is exactly what the GPU would issue.
   * every offset is also checked against int32, because the kernel's
@@ -21,6 +23,12 @@ offline half of "this kernel cannot fault the device":
     lanes at the constant byte offset ``0x7FFFFFFF``.  The audit reports, per
     plane, whether the V# bounds check would have had to drop that access —
     and ``fault_check()`` re-derives the d07-2 fault address from such a store.
+
+Thread mapping: ``grid.y = rows``, ``grid.x`` covers the column range.  v0 used
+one thread per output *column* (``col = ptile * THREADS + tid``).  v1 (round A,
+page-per-thread) uses one thread per compressed *page*:
+``page = ptile * THREADS + tid``, ``col = 4 * page + off``, and the four columns
+of a page share one page-table entry, one physical page and one scale triple.
 
 Usage::
 
@@ -126,6 +134,18 @@ class Checker:
         self.acc(plane, off, nbytes, detail)
 
 
+def pages_of(columns):
+    """Compressed pages the grid must cover (one thread per page)."""
+    return (int(columns) + PAGE - 1) // PAGE
+
+
+def grid_of(columns, threads=THREADS):
+    """(threads, ptiles, lanes) of the page-per-thread grid."""
+    pages = pages_of(columns)
+    ptiles = (pages + threads - 1) // threads
+    return threads, ptiles, ptiles * threads
+
+
 def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
     """Closed form: every address expression is monotone, so the corner is worst."""
     columns = columns_of(width, max_columns)
@@ -166,16 +186,20 @@ def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
         c.i32.append(("logits", idx, 0, "out_idx"))
     c.store("logits", idx * 4, 4, "row, col at max")
 
+    threads, ptiles, lanes = grid_of(columns)
     return {
         "mode": "analytic",
         "sizes": sizes,
         "grid": {
-            # grid.x = ceil(columns / threads), grid.y = rows; the grid must cover
+            # grid.x = ceil(pages / threads), grid.y = rows; the grid must cover
             # every output element and must not exceed the y limit (65535).
-            "threads": THREADS,
-            "ptiles": (columns + THREADS - 1) // THREADS,
-            "lanes": ((columns + THREADS - 1) // THREADS) * THREADS,
-            "covers_all_columns": ((columns + THREADS - 1) // THREADS) * THREADS >= columns,
+            "mapping": "page-per-thread (v1)",
+            "threads": threads,
+            "pages": pages_of(columns),
+            "ptiles": ptiles,
+            "lanes": lanes,
+            "columns_covered": PAGE * lanes,
+            "covers_all_columns": PAGE * lanes >= columns,
             "grid_y_ok": rows <= 65535,
         },
         "accesses": c.n,
@@ -187,20 +211,21 @@ def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
     }
 
 
-def _visit_cols(columns, threads, full):
-    ptiles = (columns + threads - 1) // threads
+def _visit_pages(columns, threads, full):
+    """Page indices to enumerate: all lanes when small, else the edges."""
+    ptiles = (pages_of(columns) + threads - 1) // threads
     lanes = ptiles * threads                 # every lane the grid launches
     if full:
         return list(range(lanes))
     edge = set(range(min(4, lanes)))
     edge |= set(range(max(0, lanes - 4), lanes))
-    for col in (columns - 1, columns, columns + 1):
-        if 0 <= col < lanes:
-            edge.add(col)
+    for page in (pages_of(columns) - 1, pages_of(columns), pages_of(columns) + 1):
+        if 0 <= page < lanes:
+            edge.add(page)
     for t in range(1, ptiles):               # block boundaries
-        for col in (t * threads - 1, t * threads):
-            if 0 <= col < lanes:
-                edge.add(col)
+        for page in (t * threads - 1, t * threads):
+            if 0 <= page < lanes:
+                edge.add(page)
     return sorted(edge)
 
 
@@ -213,57 +238,57 @@ def audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns=None,
     key_row_bytes = HDIM * kv_elem
     k_bytes = (2 if fmt == "fp8" else 4) * 4
     table = edge_page_table(requests, width, cache_pages)
-    lanes = ((columns + threads - 1) // threads) * threads
+    _, _, lanes = grid_of(columns, threads)
     full = rows * lanes <= full_limit
     if full:
         row_iter = list(range(rows))
     else:
         cand = sorted({0, 1, rows - 2, rows - 1})
         row_iter = [r for r in cand if 0 <= r < rows][:max_rows]
-    cols = _visit_cols(columns, threads, full)
+    pages = _visit_pages(columns, threads, full)
     c = Checker(sizes)
     sentinel = 0
     for row in row_iter:
         c.acc("token_to_request", row * 4, 4, f"row={row}")
         c.acc("query_positions", row * 4, 4, f"row={row}")
-        for col in cols:
-            col_ok = col < columns
-            logical, off = col // PAGE, col % PAGE
-            logical_ok = logical < width
-            safe_logical = logical if logical_ok else 0
+        for page in pages:
+            # one page-table entry for the whole page (four columns)
+            logical_ok = page < width
+            safe_logical = page if logical_ok else 0
             for req in sorted({0, requests - 1}):
                 c.acc("context_lens", req * 4, 4, f"row={row} req={req}")
                 c.acc("page_table", (req * width + safe_logical) * 4, 4,
-                      f"req={req} logical={safe_logical} (masked)")
+                      f"req={req} page={safe_logical} (masked)")
                 entry = table[req][safe_logical]
                 page_ok = 0 <= entry < cache_pages
                 phys = entry if page_ok else 0
-                k_base = phys * page_bytes + off * key_row_bytes
-                for s in range(STEPS):
-                    c.acc("compressed_k_cache", k_base + s * k_bytes, k_bytes,
-                          f"phys={phys} off={off} s={s} page_ok={page_ok}")
-                if fmt == "fp8":
-                    c.acc("compressed_k_scale", (phys * PAGE + off) * 4, 4,
-                          f"phys={phys} off={off} page_ok={page_ok}")
+                for off in range(PAGE):        # the four key rows of the page
+                    k_base = phys * page_bytes + off * key_row_bytes
+                    for s in range(STEPS):
+                        c.acc("compressed_k_cache", k_base + s * k_bytes, k_bytes,
+                              f"phys={phys} off={off} s={s} page_ok={page_ok}")
+                    if fmt == "fp8":
+                        c.acc("compressed_k_scale", (phys * PAGE + off) * 4, 4,
+                              f"phys={phys} off={off} page_ok={page_ok}")
             for h in range(HEADS):
                 for s in range(STEPS):
                     c.acc("q", row * Q_ROW_BYTES + h * HDIM * 2 + s * 16, 16,
                           f"row={row} h={h} s={s}")
-            if col_ok:
-                idx = min(row * columns + col, rows * columns - 1)
-                c.store("logits", idx * 4, 4, f"row={row} col={col}")
-            else:
-                sentinel += 1
-            if col == 0:
+            for off in range(PAGE):
+                col = page * PAGE + off
+                if col < columns:
+                    idx = min(row * columns + col, rows * columns - 1)
+                    c.store("logits", idx * 4, 4, f"row={row} col={col}")
+                else:
+                    sentinel += 1
+            if page == 0:
                 c.store("visible_groups", row * 4, 4, "writer (tid==0, ptile==0)")
                 c.store("row_starts", row * 4, 4, "writer (tid==0, ptile==0)")
-            else:
-                sentinel += 2
     return {
         "mode": "enumerate",
         "full": full,
         "rows_visited": len(row_iter),
-        "cols_visited": len(cols),
+        "pages_visited": len(pages),
         "lanes": lanes,
         "sizes": sizes,
         "accesses": c.n,
@@ -385,10 +410,10 @@ def main(argv=None) -> int:
         rc |= 0 if rec["ok"] else 1
         if not args.quiet:
             print("[%s] %-26s %-4s rows=%4d reqs=%3d cols=%6d pages=%7d | analytic oob=%d i32=%d"
-                  " | enum oob=%d i32=%d rows=%d cols=%d%s"
+                  " | enum oob=%d i32=%d rows=%d pages=%d%s"
                   % ("PASS" if rec["ok"] else "FAIL", name, fmt, rows, requests,
                      rec["shape"]["columns"], cache_pages, len(a["oob"]), len(a["i32"]),
-                     len(e["oob"]), len(e["i32"]), e["rows_visited"], e["cols_visited"],
+                     len(e["oob"]), len(e["i32"]), e["rows_visited"], e["pages_visited"],
                      "" if rec["ok"] else "   <-- CHECK"))
             if oversized:
                 print("        over i32 cap: %s" % oversized)

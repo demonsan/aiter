@@ -276,6 +276,8 @@ def _exec(env: Env, P: int, src: str, name: str, **closure):
         "TDM_K_TILE_BYTES": 64 * ROW,
         "WMMA_ROWS_PER_WAVE": C["WMMA_ROWS_PER_WAVE"],
         "SUPPORTED_PAGE_SIZES": C["SUPPORTED_PAGE_SIZES"],
+        # ROUND-DEC20D: the default builders have no K-direct (kd=0: TDM gather + LDS tile)
+        "kd": 0,
     }
     exec(_top("_check_page_size"), ns)
     exec(_top("_p16_row_ids"), ns)

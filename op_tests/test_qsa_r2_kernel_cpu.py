@@ -189,6 +189,8 @@ def _decg_ns(P, group_rows, row_mode, qp, env):
         "ld_uniform_pos": lambda rsrc, row: FI(int(qp[_i(row)])),
         # ROUND-DEC20: the ll=0 builders select no lane-parallel metadata loader
         "meta_lanes_fn": lambda *a: None,
+        # ROUND-DEC20D: the default builders have no K-direct (kd=0)
+        "kd": 0,
     }
     for top in ("_RowMeta", "_Pass"):
         node = next(

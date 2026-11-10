@@ -56,7 +56,7 @@ TOOL_VERSION = 1
 GOLDEN_REVISION = "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8"
 GOLDEN_RTOL = 1e-4
 GOLDEN_ATOL = 1e-4
-KERNEL_GIT_REV = "dec20b"
+KERNEL_GIT_REV = "dec20c"
 #: Profiled kernel (ROUND-R2 4150ad40: P in {4, 8, 16} + decode-group group_rows /
 #: row_mode / wg_waves + draft wg_waves). `emit` refuses any other source so a kernel
 #: change can never silently inherit evidence.
@@ -87,11 +87,13 @@ R3_KERNEL_SHA256 = "6b537f3bc8caa54d7b6dfd66a5ff7ca396d0647c189febeadf4d48c1f9f5
 #: ROUND-DEC20: opt-in ``ll`` (1 / 2) low-latency prologue of the draft / decode-group
 #: builders (new kernel names ``_ll`` / ``_ll2``); every page-4/8/16 bf16+fp8 default and
 #: routable specialization byte-identical to R3 6b537f3b (no-device gate base 6b537f3b:
-#: records/dec20/v5/isa-evidence.json; wide page-table loads clamped in bounds; draft ll=3
+#: records/dec20/v6/isa-evidence.json; wide page-table loads clamped in bounds; draft ll=3
 #: speculative request id; decode-group multi-slab ``slabs``; ROUND-DEC20B decode-group ll=3
 #: speculative group request + fp8 fast-K ``fk`` -- every DEC20 v4 0891fca7 candidate
-#: specialization is also unchanged).
-KERNEL_SHA256 = "3bc016ce159050d8f5b1136cd19116944f8d3fba4690beb16483226bc436d6dc"
+#: specialization is also unchanged; ROUND-DEC20C decode-group ll=3 ``sg`` lane-vector TDM row
+#: ids / speculative gather + ``sw`` split tensor wait -- every DEC20 v4 + DEC20B candidate
+#: specialization identical to 3bc016ce).
+KERNEL_SHA256 = "cd081021d94b33a0dff931e6230f2a8977b122b7e4ebaec728b9727af8eab26d"
 #: The ISA-identity chain page-4 evidence travels along (each link one no-device gate:
 #: records/page16, records/r2-kernel, records/r2c, records/r2d, records/r2e,
 #: records/integration/lint-isa, records/integration/r3-aiter/decg-key isa-evidence.json).
@@ -151,7 +153,7 @@ _GATE_TEXT = {
         "ROUND-DEC20",
         (
             "every page-4/8/16 bf16+fp8 default and routable specialization "
-            "(opt-in ll / slabs / fk builder keywords only; defaults unchanged)"
+            "(opt-in ll / slabs / fk / sg / sw builder keywords only; defaults unchanged)"
         ),
     ),
     R3_KERNEL_SHA256: (

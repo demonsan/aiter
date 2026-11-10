@@ -56,7 +56,7 @@ TOOL_VERSION = 1
 GOLDEN_REVISION = "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8"
 GOLDEN_RTOL = 1e-4
 GOLDEN_ATOL = 1e-4
-KERNEL_GIT_REV = "lint-black-ruff"
+KERNEL_GIT_REV = "dec20-ll"
 #: Profiled kernel (ROUND-R2 4150ad40: P in {4, 8, 16} + decode-group group_rows /
 #: row_mode / wg_waves + draft wg_waves). `emit` refuses any other source so a kernel
 #: change can never silently inherit evidence.
@@ -83,7 +83,12 @@ LINT_KERNEL_SHA256 = "c01cf365d7e6cd734bcde6977707c8c4c47c89d0b17c98b811e16dc6e8
 #: dict that FlyDSL folds into every kernel's cache key); every page-4/8/16 bf16+fp8
 #: default and routable specialization byte-identical to c01cf365 (no-device gate base
 #: c01cf365: records/integration/r3-aiter/decg-key).
-KERNEL_SHA256 = "6b537f3bc8caa54d7b6dfd66a5ff7ca396d0647c189febeadf4d48c1f9f5d8ad"
+R3_KERNEL_SHA256 = "6b537f3bc8caa54d7b6dfd66a5ff7ca396d0647c189febeadf4d48c1f9f5d8ad"
+#: ROUND-DEC20: opt-in ``ll`` (1 / 2) low-latency prologue of the draft / decode-group
+#: builders (new kernel names ``_ll`` / ``_ll2``); every page-4/8/16 bf16+fp8 default and
+#: routable specialization byte-identical to R3 6b537f3b (no-device gate base 6b537f3b:
+#: records/dec20/isa-evidence.json).
+KERNEL_SHA256 = "61b1c77eef0fe6fc692b6047a9593afae7c9864440ae36e6166f788735f4da2d"
 #: The ISA-identity chain page-4 evidence travels along (each link one no-device gate:
 #: records/page16, records/r2-kernel, records/r2c, records/r2d, records/r2e,
 #: records/integration/lint-isa, records/integration/r3-aiter/decg-key isa-evidence.json).
@@ -95,8 +100,9 @@ ISA_IDENTITY_CHAIN = (
     R2D_KERNEL_SHA256,  # R2D: R2C -> R2D
     R2E_KERNEL_SHA256,  # R2E: R2D -> R2E
     LINT_KERNEL_SHA256,  # AITER-LINT: R2E -> lint
+    R3_KERNEL_SHA256,  # AITER-R3: lint -> cache-key fix
     KERNEL_SHA256,
-)  # AITER-R3: lint -> cache-key fix
+)  # ROUND-DEC20: R3 -> ll opt-in builders
 #: ROUND-R2B: variants whose default ISA changed on a link (final sha -> vids). Their
 #: page-4 evidence does NOT carry over (pending until the GPU `gen_profile check`); every
 #: other page-4 specialization must still be byte-identical on that link.
@@ -139,6 +145,13 @@ _GATE_TEXT = {
         ),
     ),
     KERNEL_SHA256: (
+        "ROUND-DEC20",
+        (
+            "every page-4/8/16 bf16+fp8 default and routable specialization "
+            "(opt-in ll builder keyword only; ll=0 generated code unchanged)"
+        ),
+    ),
+    R3_KERNEL_SHA256: (
         "AITER-R3",
         (
             "every page-4/8/16 bf16+fp8 default and routable specialization "

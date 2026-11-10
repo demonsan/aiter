@@ -187,6 +187,8 @@ def _decg_ns(P, group_rows, row_mode, qp, env):
         "WMMA_K_STEPS": 4,
         "_frag": lambda rsrc, off: _i(off),
         "ld_uniform_pos": lambda rsrc, row: FI(int(qp[_i(row)])),
+        # ROUND-DEC20: the ll=0 builders select no lane-parallel metadata loader
+        "meta_lanes_fn": lambda *a: None,
     }
     for top in ("_RowMeta", "_Pass"):
         node = next(

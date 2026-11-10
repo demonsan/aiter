@@ -217,12 +217,14 @@ class ProfileDefaults(unittest.TestCase):
         self.assertEqual(self.data["kernel"]["sha256"], g.KERNEL_SHA256)
         # AITER-LINT: R2D -> R2E 58051973 (GPU-checked) -> black/ruff-only kernel
         # AITER-R3: -> deterministic cache-key kernel (no generated-code change)
+        # ROUND-DEC20: -> opt-in ll builders (ll=0 generated code unchanged)
         self.assertEqual(
-            g.ISA_IDENTITY_CHAIN[-4:],
+            g.ISA_IDENTITY_CHAIN[-5:],
             (
                 g.R2D_KERNEL_SHA256,
                 g.R2E_KERNEL_SHA256,
                 g.LINT_KERNEL_SHA256,
+                g.R3_KERNEL_SHA256,
                 g.KERNEL_SHA256,
             ),
         )

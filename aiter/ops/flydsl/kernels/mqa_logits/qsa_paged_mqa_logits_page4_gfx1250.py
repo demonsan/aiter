@@ -6243,6 +6243,34 @@ def _fk_tag(fk: int) -> str:
     return "_fk" if fk else ""
 
 
+# ROUND-DEC20C (DEC20C_SG): decode-group builder keywords ``sg`` 0 / 1 / 2 (lane-vector TDM row
+# ids; 2 = + speculative slab-0 gather before the hit / visible checks) and ``sw`` 0 / 1 (split
+# tensor wait per WMMA N tile). Defaults 0 = the existing kernels (same names, same IR). ll=3
+# only; with sg the ll=3 body also supports slabs 2 / 4; sw with slabs > 1 needs sg 2 (the next
+# slab is then always in flight, so each tile's TENSORcnt threshold is a trace-time constant).
+SG_MODES = (0, 1, 2)
+SW_MODES = (0, 1)
+
+
+def _check_sg_sw(sg, sw, ll: int, slabs: int):
+    g, w = int(sg), int(sw)
+    if g not in SG_MODES:
+        raise ValueError(f"sg must be one of {SG_MODES}")
+    if w not in SW_MODES:
+        raise ValueError(f"sw must be one of {SW_MODES}")
+    if (g or w) and int(ll) != 3:
+        raise ValueError("sg / sw (DEC20C) need the decode-group ll=3 body")
+    if w and not g:
+        raise ValueError("sw (split tensor wait) needs sg >= 1")
+    if w and int(slabs) > 1 and g != 2:
+        raise ValueError("sw with slabs > 1 needs sg=2 (next slab always in flight)")
+    return g, w
+
+
+def _sg_tag(sg: int, sw: int) -> str:
+    return (f"_sg{sg}" if sg else "") + ("_sw" if sw else "")
+
+
 def _kraw_fp8_fk(src, byte_off, kgrp):
     """DEC20B fk: the lane's 2 x 8 fp8 bytes of one K step from the TDM tile (two ds_load_b64
     at ``byte_off + kgrp * 8`` and ``+ 16``) -- the dwords the b128 path selects by kgrp."""
@@ -7587,6 +7615,8 @@ def _build_decode_group_kernel(
     ll: int = 0,
     slabs: int = 1,
     fk: int = 0,
+    sg: int = 0,
+    sw: int = 0,
 ):
     """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
 
@@ -7604,7 +7634,8 @@ def _build_decode_group_kernel(
     slabs = int(slabs)
     if slabs not in DECG_SLABS:
         raise ValueError(f"decode-group slabs must be one of {DECG_SLABS}")
-    if ll == 3 and slabs != 1:  # DEC20B: speculative group request, single-slab body only
+    sg, sw = _check_sg_sw(sg, sw, ll, slabs)  # DEC20C (0, 0 = unchanged kernels)
+    if ll == 3 and slabs != 1 and not sg:  # DEC20B: speculative group request, single slab
         raise ValueError("decode-group ll=3 (speculative group request) requires slabs=1")
     fk = _check_fk(fk, is_fp8, ll)
     if slabs > 1 and wave_cols != 32:
@@ -7638,6 +7669,8 @@ def _build_decode_group_kernel(
     sched = decg_fp8_sched() if is_fp8 else "base"  # ROUND-FP8PERF; bf16 unchanged
     if fk and (sched != "base" or _FP8_CVT_ASM):
         raise ValueError("decode-group fk needs the base fp8 schedule (intrinsic converter)")
+    if sw and sched != "base":
+        raise ValueError("decode-group sw (split tensor wait) needs the base fp8 schedule")
     sched_tag = (
         f"_s{sched}"
         if (is_fp8 and not _FP8_CVT_ASM and sched != _DECG_FP8_SCHED_DEFAULT)
@@ -7655,6 +7688,7 @@ def _build_decode_group_kernel(
         + _ll_tag(ll)
         + (f"_ms{slabs}" if slabs != 1 else "")
         + _fk_tag(fk)
+        + _sg_tag(sg, sw)
     )
 
     def _i01(cond):
@@ -8122,8 +8156,14 @@ def _build_decode_group_kernel(
         width,
         num_pages,
         pre=None,
+        wbase=None,
     ):
-        """[(store_ok, byte_off, value)]: rows a/b of every tile column (r16 order)."""
+        """[(store_ok, byte_off, value)]: rows a/b of every tile column (r16 order).
+
+        DEC20C ``wbase`` (sw kernels only; None = unchanged): the caller did NOT wait for the
+        slab's gathers; N tile nt waits until TENSORcnt <= wbase + n_ops - 2 (nt + 1) (its two
+        8-row gathers landed; same-wave tensor ops complete in order) right before its LDS reads,
+        so tile nt's LDS loads / conversion / WMMAs overlap the later tiles' gathers."""
         neg_inf = fx.Float32(_NEG_INF)
 
         def _tile_k(nt):
@@ -8165,7 +8205,20 @@ def _build_decode_group_kernel(
                 fx.gemm(atom, acc_t, _rmem8(qf[s]), _rmem8(kf[s]), acc_t)
             return acc_t.load()
 
-        if sched == "kpipe":
+        split = wbase is not None  # DEC20C sw (trace-time)
+        if split:
+            tiles, accs = [], []
+            for nt in range_constexpr(n_tiles):
+                fx.rocdl.tdm_ops.tensor_wait(int(wbase) + n_tiles * 2 - 2 * (nt + 1))
+                tiles.append(_tile_k(nt))
+                if fk:
+                    fx.rocdl.sched_barrier(0)
+                    accs.append(_tile_mma([_kcvt_fp8_fk(r) for r in tiles[nt][0]]))
+                else:
+                    accs.append(_tile_mma(tiles[nt][0]))
+                # tile nt's compute stays before tile nt+1's wait (no hoisting of the wait)
+                fx.rocdl.sched_barrier(0)
+        elif sched == "kpipe":
             # ROUND-FP8PERF: region t = WMMAs of tile t-1 + K conversion of tile t
             # (co-execution, kernel-wiki mi400-valu-coexec Â§2.2), sched_barrier-fenced.
             tiles, accs = [], []
@@ -8186,7 +8239,7 @@ def _build_decode_group_kernel(
         out = []
         for nt in range_constexpr(n_tiles):
             c = cols[nt]
-            if sched == "kpipe" or fk:
+            if sched == "kpipe" or fk or split:
                 page_ok, scale, acc = tiles[nt][1], tiles[nt][2], accs[nt]
             else:
                 kf, page_ok, scale = _tile_k(nt)
@@ -8698,7 +8751,370 @@ def _build_decode_group_kernel(
                         if msk_h[j2][0]:
                             _st_f32(logits_rsrc, msk_h[j2][1], neg_inf)
 
-    if slabs > 1:
+    # ---- ROUND-DEC20C (DEC20C_SG): ll=3 body with lane-vector TDM row ids (sg 1 / 2) --------
+    # The DEC20B no-device ISA of ``kernel_spec`` (decg bf16 P4 w32 ll3, i32) shows 326 / 252 /
+    # 215 instructions (P4 / P8 / P16; 231 / 174 / 144 SALU, 21 / 12 / 9 v_readlane SGPR-spill
+    # reloads, 28 / 20 / 16 s_delay_alu) between the hit branch target and the first
+    # tensor_load_to_lds -- all after the prologue loads returned, i.e. on the critical path:
+    # per page entry a readfirstlane + the in-bounds shift select chain + 5 validation SALU ops
+    # + 3 row-id ORs, the group metadata, the writer stores and the masked-slab branch. GPU
+    # round 2 (trace4 bf16 C8 ll3 0.815 / 0.790 / 0.771 at P4 / P8 / P16: 0.15 us for 6 more
+    # entries) is consistent with that chain costing time. DEC20C:
+    #   sg 1  each lane loads ONE page-table entry (lane j = column col0 + 32h + j: entry
+    #         (col0 + 32h + j) // P, clamped in bounds per lane), validates it and forms its
+    #         row id ``phys * P + j % P`` in VALU (same values as ``_wide_row_ids``); the 8 row
+    #         ids of gather group g are ``v_readlane`` of lanes 8g..8g+7, emitted at the issue
+    #         point (no SALU per entry, no shift chain, no SGPR live ranges across the
+    #         prologue); the hit path issues the gather before the writer stores.
+    #   sg 2  sg 1 + speculative gather: slab 0 of the speculative request is issued right
+    #         after the row ids, BEFORE the hit / visible checks (row ids are validated, so the
+    #         gather is in bounds whatever the outcome); a miss waits for it (TENSORcnt 0)
+    #         before its own gathers reuse the tile, an invisible slab waits for it before the
+    #         wave ends. Multi-slab (slabs 2 / 4): every next slab is issued unconditionally
+    #         (no wasted bytes when the group's visible range covers the span, e.g. MTP verify
+    #         at ctx >= columns; ragged groups gather dead slabs).
+    #   sw    split tensor wait (``_pass_values`` wbase): tile nt's LDS reads / fp8 conversion /
+    #         WMMAs start once ITS two gathers landed (hit path; slabs 1 or sg 2).
+    # ``ll == 3`` only; ``slabs`` 1 / 2 / 4 (the multi-slab hit path = the ``kernel_ms`` loop for
+    # pass 0 of the speculative request); the miss path is the ll=2 body with all passes (the
+    # ``kernel_ms`` loop, exact for any token_to_request). Kernel-name suffix ``_sg<n>[_sw]``.
+    class _LaneRows:
+        """Row ids of one slab held one per lane; ``[g]`` = the 8 SGPR row ids of gather
+        group g (v_readlane of lanes 8 (g % 4) .. + 7 of half g // 4), emitted at use."""
+
+        def __init__(self, vecs):
+            self.vecs = vecs
+
+        def __getitem__(self, g):
+            v = self.vecs[g // 4]
+            return [_readlane_i32(v, (g % 4) * 8 + r) for r in range(8)]
+
+    def _lane_ents(pt_rsrc, safe_req, c0, width, nreq, lane):
+        """Per 32-column half: the page-table entry of column c0 + 32h + lane (one lane
+        load, index clamped into the table) + its logical-page bound."""
+        total = _imax(nreq, 1) * width
+        out = []
+        for h in range_constexpr(wave_cols // 32):
+            logical = (c0 + 32 * h + lane) // P
+            ent_ix = _imax(_imin(safe_req * width + logical, total - 1), 0)
+            out.append((_ld_i32(pt_rsrc, ent_ix * 4), logical < width))
+        return out
+
+    def _lane_rid_vecs(ents, req_ok, num_pages, lane):
+        """Per half: (row id, page ok) of the lane's column in VALU (same values as the
+        validated ``_wide_row_ids`` / ``_lane_pages_pass`` math)."""
+        rids, oks = [], []
+        for ent, logical_ok in ents:
+            valid = req_ok & logical_ok & (ent >= 0) & (ent < num_pages)
+            rids.append(valid.select(ent, 0) * P + lane % P)
+            oks.append(_i01(valid))
+        return rids, oks
+
+    def _bperm_i32(val, src_lane):
+        """Lane ``src_lane``'s ``val`` (ds_bpermute_b32: LDS crossbar, no LDS memory)."""
+        from flydsl._mlir.dialects import llvm
+
+        return fx.Int32(
+            llvm.call_intrinsic(
+                fx.Int32.ir_type,
+                "llvm.amdgcn.ds.bpermute",
+                [fx.Int32(src_lane * 4).ir_value(), fx.Int32(val).ir_value()],
+                [],
+                [],
+            )
+        )
+
+    def _sg_rows(ents, spec_ok, num_pages, lane):
+        rids, oks = _lane_rid_vecs(ents, spec_ok, num_pages, lane)
+        return (_LaneRows(rids), rids, oks)
+
+    def _sg_pre(ks_rsrc, rr, n_in):
+        """(lane rows, [(row id, page ok)] per N tile [, fp8 K scales]): the WMMA lane's
+        column c0 + 16 nt + n_in is lane 16 (nt % 2) + n_in of half nt // 2 -> its row id
+        (= phys * P + c % P, phys 0 when invalid: the scale index of ``_scale_fp8``) and page
+        ok by ds_bpermute; no second page-table load, the scale load issues with the TDM."""
+        _rows, rids, oks = rr
+        tiles = []
+        for nt in range_constexpr(n_tiles):
+            src = (nt % 2) * WMMA_N + n_in
+            rid_t = _bperm_i32(rids[nt // 2], src)
+            ok_t = _bperm_i32(oks[nt // 2], src) != 0
+            tiles.append((rid_t, ok_t))
+        pre = (_rows, tiles)
+        if is_fp8:
+            pre = pre + ([_ld_f32(ks_rsrc, t[0] * 4) for t in tiles],)
+        return pre
+
+    def _sg_pin(pres_h):
+        """fp8: pin slab 0's K scales after the hit computation (the machine sinker would
+        otherwise issue them only inside the hit branch); the wait lands under the gather."""
+        if not is_fp8:
+            return
+        from flydsl._mlir.dialects import llvm
+
+        vals = [fx.Float32(v).ir_value() for v in pres_h[0][2]]
+        llvm.inline_asm(
+            None, vals, "; dec20c pin", ",".join(["v"] * len(vals)), has_side_effects=True
+        )
+
+    n_buf = 2 if slabs > 1 else 1  # wave-private LDS tiles (double buffer for slabs > 1)
+
+    def _storage_sg():
+        return (
+            fx.SharedAllocator(base_alignment=128, static=True)
+            .allocate(fx.Array[fx.Int32, n_buf * waves * tile_bytes // 4, 128])
+            .peek()
+            .ptr
+        )
+
+    def _sg_slab_cols(bx, wave):
+        c0s = [
+            bx * (span * slabs) + s * span + wave * wave_cols
+            for s in range_constexpr(slabs)
+        ]
+        c0n = [c0s[s + 1] for s in range_constexpr(slabs - 1)] + [fx.Int32(2**31 - 1)]
+        return c0s, c0n
+
+    def _sg_tile(wave, s):
+        return wave * n_buf + s % n_buf
+
+    def _sg_spec_issue(KV, storage, c0s, width, num_pages, wave, pres_h):
+        if sg == 2:  # speculative slab-0 gather (before the hit / visible checks)
+            _issue(KV, storage, None, None, c0s[0], width, num_pages, _sg_tile(wave, 0), pres_h[0])
+            fx.rocdl.sched_barrier(0)  # the gather first; masks / scales after it
+
+    def _sg_first_issue(KV, storage, c0s, width, num_pages, wave, pres_h):
+        if sg == 1:
+            _issue(KV, storage, None, None, c0s[0], width, num_pages, _sg_tile(wave, 0), pres_h[0])
+
+    def _sg_first_ok(c0s, vmax):
+        return c0s[0] < vmax
+
+    def _sg_next_ok(s, c0n, vmax):
+        if sg == 2:  # unconditional next-slab gather (c0n = INT32_MAX after the last slab)
+            return c0n[s] < fx.Int32(2**31 - 1)
+        return c0n[s] < vmax
+
+    def _sg_next(KV, storage, s, c0s, width, num_pages, wave, pres_h):
+        if s + 1 < slabs:
+            _issue(
+                KV, storage, None, None, c0s[s + 1], width, num_pages,
+                _sg_tile(wave, s + 1), pres_h[s + 1],
+            )
+            if not sw:
+                fx.rocdl.tdm_ops.tensor_wait(n_tiles * 2)
+        elif not sw:
+            fx.rocdl.tdm_ops.tensor_wait(0)
+
+    def _sg_last(s):
+        if not sw:
+            fx.rocdl.tdm_ops.tensor_wait(0)
+
+    def _sg_wbase(s):
+        if not sw:
+            return None
+        return n_tiles * 2 if (sg == 2 and s + 1 < slabs) else 0
+
+    def _sg_miss_entry():
+        if sg == 2:
+            fx.rocdl.tdm_ops.tensor_wait(0)  # the speculative gather landed in tile 0
+
+    def _sg_hit_exit():
+        if sg == 2:
+            fx.rocdl.tdm_ops.tensor_wait(0)  # no TDM write in flight when the wave ends
+
+    def _sg_miss_next(KV, storage, pt_rsrc, pp, s, c0s, width, num_pages, wave, presl, p):
+        if s + 1 < slabs:
+            _issue(
+                KV, storage, pt_rsrc, pp, c0s[s + 1], width, num_pages,
+                _sg_tile(wave, s + 1), presl[s + 1][p],
+            )
+            fx.rocdl.tdm_ops.tensor_wait(n_tiles * 2)
+        else:
+            fx.rocdl.tdm_ops.tensor_wait(0)
+
+    def _sg_miss_first(KV, storage, pt_rsrc, pp, c0s, width, num_pages, wave, presl, p):
+        _issue(
+            KV, storage, pt_rsrc, pp, c0s[0], width, num_pages, _sg_tile(wave, 0), presl[0][p]
+        )
+
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
+    def kernel_spec_sg(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bx = fx.Int32(fx.block_idx.x)
+        grp = fx.Int32(fx.block_idx.y)
+        wave = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        t0 = grp * group_rows
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        _kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        q_early = _q_early_ll(q_rsrc, t0, rows, n_in, kgrp)
+        spec = _imax(_imin(grp, num_requests - 1), 0)
+        spec_ok = (spec >= 0) & (spec < num_requests)
+        req_l, pos_l = _spec_loads(t2r_rsrc, qp_rsrc, t0, rows, lane)
+        ctx_l = _ld_i32(cl_rsrc, spec * 4)
+        c0s, c0n = _sg_slab_cols(bx, wave)
+        ents_h = [
+            _lane_ents(pt_rsrc, spec, c0s[s], width, num_requests, lane)
+            for s in range_constexpr(slabs)
+        ]
+        storage = _storage_sg()
+        # every prologue load (Q, t2r, pos, ctx, page table) issued before the first wait
+        fx.rocdl.sched_barrier(0)
+        rows_h = [
+            _sg_rows(ents_h[s], spec_ok, num_pages, lane) for s in range_constexpr(slabs)
+        ]
+        _sg_spec_issue(KV, storage, c0s, width, num_pages, wave, rows_h)
+        pres_h = [_sg_pre(ks_rsrc, rows_h[s], n_in) for s in range_constexpr(slabs)]
+        vm_s = _vm_spec(req_l, pos_l, _readfirstlane_i32(ctx_l))
+        hit = _spec_hit(vm_s, spec, spec_ok)
+        miss = hit == 0
+        plans_h, my_vis_h, meta_off_h, writer_h = _head_vm(
+            t0, rows, num_requests, kgrp, lane, bx, wave, vm_s
+        )
+        _sg_pin(pres_h)
+        pp_h = plans_h[0]
+        atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
+        )
+        colss, offss = _slab_lists(c0s, t0, kgrp, n_in, rows, columns)
+        neg_inf = fx.Float32(_NEG_INF)
+        ksrcs = [
+            storage + _sg_tile(wave, b) * (tile_bytes // 4) for b in range_constexpr(n_buf)
+        ]
+        if miss:
+            _sg_miss_entry()
+            plans_m, my_vis_m, meta_off_m, writer_m = group_head(
+                t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
+            )
+            presl_m = _slab_pres(
+                pt_rsrc, plans_m, c0s, n_in, width, num_pages, num_requests, ks_rsrc=ks_rsrc
+            )
+            if writer_m:
+                _st_i32(vis_rsrc, meta_off_m, my_vis_m)
+                _st_i32(rst_rsrc, meta_off_m, fx.Int32(0))
+            for p in range_constexpr(n_pass):
+                pp_m = plans_m[p]
+                if pp_m.active:
+                    if c0s[0] < pp_m.vmax:
+                        _sg_miss_first(
+                            KV, storage, pt_rsrc, pp_m, c0s, width, num_pages, wave, presl_m, p
+                        )
+                    for s in range_constexpr(slabs):
+                        if c0n[s] < pp_m.vmax:
+                            _sg_miss_next(
+                                KV,
+                                storage,
+                                pt_rsrc,
+                                pp_m,
+                                s,
+                                c0s,
+                                width,
+                                num_pages,
+                                wave,
+                                presl_m,
+                                p,
+                            )
+                        if c0n[s] >= pp_m.vmax:
+                            _tensor_done()
+                        if c0s[s] < pp_m.vmax:
+                            res_m = _pass_values(
+                                atom,
+                                ksrcs[s % n_buf],
+                                ks_rsrc,
+                                pt_rsrc,
+                                q_early,
+                                pp_m,
+                                c0s[s],
+                                colss[s],
+                                offss[s],
+                                n_in,
+                                columns,
+                                width,
+                                num_pages,
+                                presl_m[s][p],
+                            )
+                            for j3 in range_constexpr(len(res_m)):
+                                if res_m[j3][0]:
+                                    _st_f32(logits_rsrc, res_m[j3][1], res_m[j3][2])
+                            _war_guard()
+                        if c0s[s] >= pp_m.vmax:
+                            msk_m = _pass_masks(pp_m, colss[s], offss[s], columns)
+                            for j4 in range_constexpr(len(msk_m)):
+                                if msk_m[j4][0]:
+                                    _st_f32(logits_rsrc, msk_m[j4][1], neg_inf)
+        if hit:
+            if pp_h.active:
+                f_ok = _sg_first_ok(c0s, pp_h.vmax)
+                if f_ok:
+                    _sg_first_issue(KV, storage, c0s, width, num_pages, wave, pres_h)
+                for s in range_constexpr(slabs):
+                    nx = _sg_next_ok(s, c0n, pp_h.vmax)
+                    if nx:
+                        _sg_next(KV, storage, s, c0s, width, num_pages, wave, pres_h)
+                    if c0n[s] >= pp_h.vmax:
+                        _sg_last(s)
+                    if c0s[s] < pp_h.vmax:
+                        res_h = _pass_values(
+                            atom,
+                            ksrcs[s % n_buf],
+                            ks_rsrc,
+                            pt_rsrc,
+                            q_early,
+                            pp_h,
+                            c0s[s],
+                            colss[s],
+                            offss[s],
+                            n_in,
+                            columns,
+                            width,
+                            num_pages,
+                            pres_h[s],
+                            _sg_wbase(s),
+                        )
+                        for j1 in range_constexpr(len(res_h)):
+                            if res_h[j1][0]:
+                                _st_f32(logits_rsrc, res_h[j1][1], res_h[j1][2])
+                        _war_guard()
+                    if c0s[s] >= pp_h.vmax:
+                        msk_h = _pass_masks(pp_h, colss[s], offss[s], columns)
+                        for j2 in range_constexpr(len(msk_h)):
+                            if msk_h[j2][0]:
+                                _st_f32(logits_rsrc, msk_h[j2][1], neg_inf)
+            if writer_h:
+                _st_i32(vis_rsrc, meta_off_h, my_vis_h)
+                _st_i32(rst_rsrc, meta_off_h, fx.Int32(0))
+            _sg_hit_exit()
+
+    if sg:
+        selected_kernel = kernel_spec_sg
+    elif slabs > 1:
         selected_kernel = kernel_ms
     elif ll == 3:
         selected_kernel = kernel_spec
@@ -8759,6 +9175,7 @@ def _build_decode_group_kernel(
     launch.wg_waves = waves
     launch.slabs = slabs
     launch.cols_per_block = span * slabs
+    launch.sg, launch.sw = sg, sw  # DEC20C
     return launch
 
 

@@ -356,16 +356,36 @@ LAUNCH_KNOBS: dict[str, dict[str, tuple]] = {
         "sg": (0, 1, 2),
         "sw": (0, 1),
         "kd": (0, 1, 2),
+        "wc": (0, 32),
     },
 }
+#: DEC20-PROMOTE: decode-group ``wc`` 32 = launch the 4-row fp8 decode group with 32-column
+#: slabs although the default-env router (QSA_DECODE_GROUP_COLS=auto) reports 64 (the
+#: variant's ``wave_cols`` stays the router's: route checks and signatures of every existing
+#: entry are unchanged; only the launch's builder slab is the pinned one). fp8 4-row groups
+#: only (bf16 and kernel-native 3-row groups are already 32). No kernel change: the same
+#: ``_build_decode_group_kernel(fp8, div, 32, ...)`` specializations the DEC20 benches ran
+#: (``wave_cols=32`` candidates). 0 (absent) = the router's slab.
 #: ROUND-DEC20C: decode-group ``sg`` 1 / 2 (ll=3 body with lane-vector TDM row ids; 2 = +
 #: speculative slab-0 gather; with sg the ll=3 body also takes slabs 2 / 4) and ``sw`` 1 (split
 #: tensor wait per WMMA tile; needs sg); 0 (absent) = the existing kernels (kernel DEC20C_SG).
 #: ROUND-DEC20D: decode-group ``kd`` 1 / 2 (K fragments loaded by the WMMA lanes straight from the
 #: K cache, no TDM / LDS; 2 = ll=3 speculative K loads before the hit check); 0 = existing kernels.
 KNOB_DEFAULTS = {
-    "wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1, "fk": 0, "sg": 0, "sw": 0, "kd": 0
+    "wg_waves": 4,
+    "group_rows": 4,
+    "ll": 0,
+    "slabs": 1,
+    "fk": 0,
+    "sg": 0,
+    "sw": 0,
+    "kd": 0,
+    "wc": 0,
 }
+#: DEC20-PROMOTE: launch knobs an entry pins although they equal :data:`KNOB_DEFAULTS`,
+#: because the default-env wrapper applies another value: fp8 draft ``wg_waves`` 4 (the
+#: wrapper's 'auto' is 2, :func:`default_knobs`). (kind, cache_dtype, knob) -> value.
+EXPLICIT_DEFAULT_PINS = {("draft", "fp8", "wg_waves"): 4}
 
 
 def variant_kind(vid: str) -> str:
@@ -383,15 +403,24 @@ def split_knobs(vid: str, params: Mapping[str, Any]) -> tuple[dict, dict]:
 
 
 def knob_errors(
-    vid: str, params: Mapping[str, Any], allow_group_rows: bool = False
+    vid: str,
+    params: Mapping[str, Any],
+    allow_group_rows: bool = False,
+    cache_dtype: str | None = None,
 ) -> list[str]:
     errs = []
-    names = LAUNCH_KNOBS.get(variant_kind(vid), {})
-    for k, v in split_knobs(vid, params)[1].items():
-        if v not in names[k] or v == KNOB_DEFAULTS[k]:
+    kind = variant_kind(vid)
+    names = LAUNCH_KNOBS.get(kind, {})
+    knobs = split_knobs(vid, params)[1]
+    for k, v in knobs.items():
+        explicit = EXPLICIT_DEFAULT_PINS.get((kind, cache_dtype, k)) == v
+        if v not in names[k] or (v == KNOB_DEFAULTS[k] and not explicit):
             errs.append(f"knob {k}={v!r} (allowed non-default {names[k][1:]})")
         if k == "group_rows" and not allow_group_rows:
             errs.append("group_rows is bucket-only (kind group)")
+    if "wc" in knobs and (cache_dtype != "fp8" or knobs.get("group_rows") == 3):
+        # DEC20-PROMOTE: the router slab is 32 already everywhere else
+        errs.append("knob wc is fp8 4-row decode-group only (router slab 64)")
     return errs
 
 
@@ -652,7 +681,7 @@ def validate_row(row: Mapping[str, Any]) -> None:
             bad(
                 f"variant {row['vid']} {row['params']} != router {vid} {params} at rows={rr}"
             )
-    for e in knob_errors(vid, row["params"]):
+    for e in knob_errors(vid, row["params"], cache_dtype=row["cache_dtype"]):
         bad(e)
 
 
@@ -868,7 +897,7 @@ def validate_rule(rule: Mapping[str, Any], kernel_sha256: str | None = None) -> 
                     f"variant {rule['vid']} {rule['params']} != router {vid} {params} at "
                     f"columns={c} rows={rr}"
                 )
-    for e in knob_errors(rule["vid"], rule["params"]):
+    for e in knob_errors(rule["vid"], rule["params"], cache_dtype=rule["cache_dtype"]):
         bad(e)
     if rule["sig"] != rule_signature(rule):
         bad(f"sig {rule['sig']} != {rule_signature(rule)}")
@@ -1095,7 +1124,12 @@ def validate_bucket(b: Mapping[str, Any], kernel_sha256: str | None = None) -> N
         )
         if b["vid"] != vid or split_knobs(vid, b["params"])[0] != params:
             bad(f"variant {b['vid']} {b['params']} != decode-group {vid} {params}")
-    for e in knob_errors(b["vid"], b["params"], allow_group_rows=b["kind"] == "group"):
+    for e in knob_errors(
+        b["vid"],
+        b["params"],
+        allow_group_rows=b["kind"] == "group",
+        cache_dtype=b["cache_dtype"],
+    ):
         bad(e)
     if b["sig"] != bucket_signature(b):
         bad(f"sig {b['sig']} != {bucket_signature(b)}")

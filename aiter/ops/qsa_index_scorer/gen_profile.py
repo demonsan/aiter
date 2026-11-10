@@ -634,9 +634,129 @@ RULE_SPEC_FP8_P16: list[dict] = [
 ]
 
 
+#: DEC20-PROMOTE: decode-regime launch knobs of the DEC20 rounds 1-4 GPU winners
+#: (records/dec20/PROMOTION.md: per (regime, dtype, requests band, columns band) the knob set
+#: winning the most cells by the median over rounds of the same-invocation ours/#3107 ratio).
+#: Each listed base rule (all page sizes: id, id_p8, id_p16) gets OVERLAY rules listed right
+#: before it: same relation / rows / table_width, a requests x columns box each (the boxes of
+#: one base rule are disjoint and tile its range), launch knobs pinned. The base rule (pass)
+#: stays unchanged: rules are selected first-verified-in-order, so a pending overlay never
+#: serves and its base keeps serving until the GPU ``gen_profile check`` passes the overlay;
+#: a checked overlay then precedes its base. (tag, requests (min, max), columns, knobs)
+_C_ALL = _POW2_ALL
+_C_SHORT = {"pow2": {"min": 64, "max": 2048}}  # ctx <= 8k (R2 matrix: ctx 4096 = 1024)
+_C_MID = {"pow2": {"min": 4096, "max": 8192}}  # ctx 16k (4096) .. 32k
+_C_LONG = {"pow2": {"min": 16384, "max": 65536}}  # ctx 64k (16384) .. 256k
+_C_UPTO8K = {"pow2": {"min": 64, "max": 8192}}
+_C_FROM4K = {"pow2": {"min": 4096, "max": 65536}}
+DEC20P_RULES: dict[str, list[tuple]] = {
+    "draft_bf16": [
+        ("q1", (1, 1), _C_ALL, {"ll": 3, "wg_waves": 2}),
+        ("ll3", (2, 512), _C_ALL, {"ll": 3}),
+    ],
+    "draft_fp8": [  # P.default_knobs pins wg_waves 2; ll3fkw4 pins 4 explicitly
+        ("q1", (1, 1), _C_ALL, {"ll": 3, "fk": 1, "wg_waves": 4}),
+        ("s", (2, 512), _C_SHORT, {"ll": 3, "fk": 1, "wg_waves": 4}),
+        ("l", (2, 512), _C_FROM4K, {"ll": 3, "fk": 1}),
+    ],
+    "decode_bf16": [
+        ("s16", (1, 16), _C_SHORT, {"ll": 3, "kd": 2, "wg_waves": 2}),
+        ("s32", (17, 32), _C_SHORT, {"ll": 3, "sg": 2, "wg_waves": 2}),
+        ("s256", (33, 256), _C_SHORT, {"ll": 3}),
+        ("s512", (257, 512), _C_SHORT, {"ll": 3, "slabs": 4, "sg": 2}),
+        ("m64", (1, 64), _C_MID, {"ll": 3}),
+        ("m512", (65, 512), _C_MID, {"ll": 3, "slabs": 4, "sg": 2}),
+        ("l16", (1, 16), _C_LONG, {"ll": 3, "wg_waves": 2}),
+        ("l512", (17, 512), _C_LONG, {"ll": 3, "slabs": 4, "sg": 2, "wg_waves": 2}),
+    ],
+    "decode_fp8": [
+        ("s", (1, 512), _C_UPTO8K, {"ll": 3, "fk": 1, "kd": 1, "wc": 32}),
+        ("l", (1, 512), _C_LONG, {"ll": 2, "fk": 1}),
+    ],
+}
+#: verify3 kernel-native group buckets (group_rows 3 kept): (tag, requests, columns, knobs)
+DEC20P_BUCKETS: dict[str, list[tuple]] = {
+    "verify3_g3_bf16": [
+        ("s32", (1, 32), _C_SHORT, {"ll": 3, "sg": 2}),
+        ("s512", (33, 512), _C_SHORT, {"ll": 3}),
+        ("l", (1, 512), _C_FROM4K, {"ll": 3}),
+    ],
+    "verify3_g3_fp8": [
+        ("s16", (1, 16), _C_SHORT, {"ll": 3, "fk": 1, "sg": 2, "sw": 1, "wg_waves": 2}),
+        ("s512", (17, 512), _C_SHORT, {"ll": 3, "fk": 1, "wg_waves": 2}),
+        ("l", (1, 512), _C_FROM4K, {"ll": 3, "fk": 1}),
+    ],
+}
+_DEC20P_NOTE = (
+    "DEC20-PROMOTE overlay of {base} (records/dec20/PROMOTION.md): knobs {knobs}"
+)
+
+
+def _dec20p_base(spec_id: str, table: dict) -> tuple[str, str] | None:
+    for base in table:
+        for sfx in ("", "_p8", "_p16"):
+            if spec_id == base + sfx:
+                return base, sfx
+    return None
+
+
+def dec20p_overlays(spec: dict, table: dict | None = None) -> list[dict]:
+    """The DEC20-PROMOTE overlay specs of one base rule / bucket spec ([] = none)."""
+    table = DEC20P_RULES if table is None else table
+    hit = _dec20p_base(spec["id"], table)
+    if hit is None:
+        return []
+    base, sfx = hit
+    out = []
+    for tag, (qlo, qhi), cols, knobs in table[base]:
+        o = json.loads(json.dumps(spec))
+        o["id"] = f"{base}_{tag}{sfx}"
+        o["requests"] = {"min": int(qlo), "max": int(qhi)}
+        o["columns"] = json.loads(json.dumps(cols))
+        o["knobs"] = dict(o.get("knobs", {}), **knobs)
+        o["notes"] = (
+            _DEC20P_NOTE.format(
+                base=spec["id"], knobs=json.dumps(knobs, sort_keys=True)
+            )
+            + f"; {spec.get('notes', '')}"
+        )
+        out.append(o)
+    return out
+
+
+def with_dec20p(specs: list[dict], table: dict | None = None) -> list[dict]:
+    """``specs`` with every DEC20-PROMOTE overlay inserted right before its base."""
+    out = []
+    for s in specs:
+        out += dec20p_overlays(s, table) + [s]
+    return out
+
+
+def dec20p_ids() -> set:
+    """Ids of every DEC20-PROMOTE overlay rule and bucket (all page sizes)."""
+    out = set()
+    for table in (DEC20P_RULES, DEC20P_BUCKETS):
+        for base, items in table.items():
+            for tag, *_ in items:
+                out |= {f"{base}_{tag}{sfx}" for sfx in ("", "_p8", "_p16")}
+    return out
+
+
+def strip_dec20p(data: dict) -> dict:
+    """A copy of a profile dict without the DEC20-PROMOTE overlays (= the pre-promotion
+    rule / bucket set, byte-identical entries)."""
+    ids = dec20p_ids()
+    out = json.loads(json.dumps(data))
+    for key in ("rules", "buckets"):
+        if key in out:
+            out[key] = [r for r in out[key] if r["id"] not in ids]
+    return out
+
+
 def all_rule_specs() -> list[dict]:
-    """Every committed rule spec, in profile order (bf16 P4/P16/P8, then fp8 P4/P8/P16)."""
-    return (
+    """Every committed rule spec, in profile order (bf16 P4/P16/P8, then fp8 P4/P8/P16;
+    DEC20-PROMOTE overlays right before their base rule)."""
+    return with_dec20p(
         RULE_SPEC
         + RULE_SPEC_P16
         + RULE_SPEC_P8
@@ -830,7 +950,9 @@ def bucket_spec() -> list[dict]:
                 "request, no padding/staging); target = the 4-row fp8 decode cell",
             }
         )
-    return out
+    # DEC20-PROMOTE: knob-pinned overlays right before the kernel-native group buckets
+    # (buckets are tried in order; a pending overlay is skipped at runtime)
+    return with_dec20p(out, DEC20P_BUCKETS)
 
 
 def bucket_samples(b: dict, extra: list[tuple] = ()) -> list[dict]:
@@ -1267,8 +1389,10 @@ def make_rule(spec: dict, extra: list[tuple] = ()) -> dict:
     # R2-MERGE: a GPU sweep winner may pin launch knobs per rule (P.LAUNCH_KNOBS, e.g.
     # {"wg_waves": 2}); a pinned rule gets a new sig, hence never inherits old evidence.
     # ROUND-R2E: the default-env wrapper knobs (P.default_knobs: fp8 draft wg_waves 2).
+    # DEC20-PROMOTE: spec knobs override the default-env ones (fp8 draft wg_waves 2 -> 4)
     params = dict(
-        params, **P.default_knobs(spec["cache_dtype"], regime), **spec.get("knobs", {})
+        params,
+        **dict(P.default_knobs(spec["cache_dtype"], regime), **spec.get("knobs", {})),
     )
     rule: dict[str, Any] = {
         "id": spec["id"],
@@ -1956,6 +2080,12 @@ def check_sample(
         rec.update(
             pass_=False, error=f"served by {rec['vid']} != rule vid {rule['vid']}"
         )
+    elif str(rec.get("cell") or "").startswith("rule:") and rec["cell"] != (
+        f"rule:{rule['id']}"
+    ):
+        # DEC20-PROMOTE: overlapping (overlay / base) rules -> the checked rule itself (an
+        # exact row still takes precedence over every rule, as at runtime)
+        rec.update(pass_=False, error=f"served by {rec['cell']}, not rule:{rule['id']}")
     out = {k: int(s[k]) for k in ("rows", "requests", "columns", "table_width")}
     out.update(fixture=fx, **rec)
     return out
@@ -2183,6 +2313,20 @@ def add_plan_samples(data: dict, plan: list[dict]) -> int:
     return n
 
 
+def _rules_overlap(a: dict, b: dict) -> bool:
+    """DEC20-PROMOTE: do two rules admit a common (rows, requests, columns, table_width)
+    class (same arch / cu / dtype / page / regime, intersecting ranges)? Conservative:
+    the rows / requests / table-width ranges and the column sets intersect."""
+    if any(a[k] != b[k] for k in ("arch", "cu", "cache_dtype", "regime")):
+        return False
+    if P.page_of(a) != P.page_of(b):
+        return False
+    for k in ("rows", "requests", "table_width"):
+        if int(a[k]["max"]) < int(b[k]["min"]) or int(b[k]["max"]) < int(a[k]["min"]):
+            return False
+    return bool(set(P.column_values(a["columns"])) & set(P.column_values(b["columns"])))
+
+
 def check(
     path: str,
     out: str | None,
@@ -2205,7 +2349,36 @@ def check(
     if plan:
         print(f"[CHECK] plan: +{add_plan_samples(data, plan)} rule samples", flush=True)
     _dump(data, target)  # stage (rules stay pending until this run restamps them)
-    os.environ["QSA_PROFILE_PATH"] = os.path.abspath(target)
+    # DEC20-PROMOTE: the API profile of this run = ``target`` minus every rule NOT being
+    # checked whose box overlaps a checked rule (overlay vs its base), so each checked rule
+    # serves its own samples (rules are selected first-verified-in-order at runtime).
+    api_path = target
+    if only in ("all", "rules"):
+        chk = [
+            r
+            for r in data.get("rules") or []
+            if not cells or f"rule:{r['id']}" in cells or r["id"] in cells
+        ]
+        drop = {
+            r["id"]
+            for r in data.get("rules") or []
+            if r["id"] not in {c["id"] for c in chk}
+            and any(_rules_overlap(r, c) for c in chk)
+        }
+        if drop:
+            staged = json.loads(json.dumps(data))
+            staged["rules"] = [r for r in staged["rules"] if r["id"] not in drop]
+            # same file name (the profile name must equal the file stem)
+            sdir = os.path.join(
+                os.path.dirname(os.path.abspath(target)), "_check_stage"
+            )
+            os.makedirs(sdir, exist_ok=True)
+            api_path = os.path.join(sdir, os.path.basename(target))
+            _dump(staged, api_path)
+            print(
+                f"[CHECK] staged without overlapping rules {sorted(drop)}", flush=True
+            )
+    os.environ["QSA_PROFILE_PATH"] = os.path.abspath(api_path)
     dev = torch.cuda.get_device_properties(0)
     stamp = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
     meta = {
@@ -2223,7 +2396,7 @@ def check(
             continue
         print(f"[CHECK] {row['cell']} ...", flush=True)
         try:
-            rec = check_row(row, api, G, S, profile=target)
+            rec = check_row(row, api, G, S, profile=api_path)
         except Exception as exc:  # noqa: BLE001
             rec = {"pass_": False, "error": f"{type(exc).__name__}: {exc}"[:2000]}
         ok = rec.pop("pass_")
@@ -2257,7 +2430,7 @@ def check(
                 f"r{s['rows']}q{s['requests']} c{s['columns']} w{s['table_width']}"
             )
             try:
-                rec = check_sample(rule, s, api, G, S, profile=target)
+                rec = check_sample(rule, s, api, G, S, profile=api_path)
             except Exception as exc:  # noqa: BLE001
                 rec = {
                     k: int(s[k]) for k in ("rows", "requests", "columns", "table_width")
@@ -2297,7 +2470,7 @@ def check(
                 f"r{s['rows']}q{s['requests']} c{s['columns']} w{s['table_width']}"
             )
             try:
-                rec = check_bucket_sample(b, s, api, G, S, profile=target)
+                rec = check_bucket_sample(b, s, api, G, S, profile=api_path)
             except Exception as exc:  # noqa: BLE001
                 rec = {
                     k: int(s[k]) for k in ("rows", "requests", "columns", "table_width")

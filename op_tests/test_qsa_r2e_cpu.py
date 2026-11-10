@@ -44,7 +44,7 @@ def _gen():
 
 def _profile():
     with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-        return json.load(fh)
+        return _gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
 
 
 class KernelDefaults(unittest.TestCase):

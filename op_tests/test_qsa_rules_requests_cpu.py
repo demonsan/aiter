@@ -39,7 +39,7 @@ E2E_W = {4: 16384, 8: 8192, 16: 4096}
 
 def _profile():
     with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-        return json.load(fh)
+        return base._gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
 
 
 GEN = base._gen()

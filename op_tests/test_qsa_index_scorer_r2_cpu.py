@@ -52,7 +52,7 @@ def _profile_copy(td, *, rules=(), buckets=(), pending=(), name="qsa_r2test_v1")
     rule / bucket ids reset to pending, e.g. to step over a committed ``pass`` bucket),
     written to ``td``."""
     with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-        data = json.load(fh)
+        data = _gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
     ksha = data["kernel"]["sha256"]
     for e in [*data["rules"], *data["buckets"]]:
         if e["id"] in pending:
@@ -183,7 +183,7 @@ class _R2Env(base._Stubs):
 class BucketProfile(unittest.TestCase):
     def setUp(self):
         with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-            self.data = json.load(fh)
+            self.data = _gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
 
     def test_committed_buckets(self):
         ids = {b["id"] for b in self.data["buckets"]}
@@ -1034,7 +1034,7 @@ class Page8(_R2Env):
                 PR.column_values(s["columns"])[0], s["table_width"]["max"] * 8
             )
         with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-            data = json.load(fh)
+            data = _gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
         rules = [
             PR.ProfileRule(r)
             for r in data["rules"]
@@ -1272,7 +1272,7 @@ class Fp8Rules(_R2Env):
     def setUp(self):
         super().setUp()
         with open(base.PROFILE_JSON, encoding="utf-8") as fh:
-            self.data = json.load(fh)
+            self.data = _gen().strip_dec20p(json.load(fh))  # DEC20-PROMOTE: legacy set
         self.prof = PR.profile_from_data(self.data)
 
     def _rules(self, page):

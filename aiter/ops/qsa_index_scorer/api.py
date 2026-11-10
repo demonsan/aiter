@@ -327,7 +327,9 @@ def _knob_kw(vid: str, params) -> dict:
     sl = int(knobs.get("slabs", P.KNOB_DEFAULTS["slabs"]))
     # ROUND-DEC20C: lane-vector row ids / speculative gather / split wait (only when pinned on)
     sgw = {
-        k: int(knobs[k]) for k in ("sg", "sw", "kd") if int(knobs.get(k, P.KNOB_DEFAULTS[k]))
+        k: int(knobs[k])
+        for k in ("sg", "sw", "kd")
+        if int(knobs.get(k, P.KNOB_DEFAULTS[k]))
     }
     return {
         "group_rows": g,
@@ -347,7 +349,21 @@ def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
     rb, rk = P.split_knobs(vid, params)
     wb, wk = P.split_knobs(want_vid, want_params)
     # ROUND-DEC20: ``ll`` / ``slabs`` are never applied by the environment (entry-pinned)
-    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs", "fk", "sg", "sw", "kd")}  # + DEC20B/C/D
+    wk = {
+        k: v
+        for k, v in wk.items()
+        if k not in ("ll", "slabs", "fk", "sg", "sw", "kd", "wc")  # + DEC20B/C/D/P
+    }
+    if (
+        P.variant_kind(vid) == "draft"
+        and "pk8" in rb  # fp8 draft variant
+        and rk.get("wg_waves") == P.default_knobs("fp8", "draft").get("wg_waves")
+        and wk.get("wg_waves")
+        == P.EXPLICIT_DEFAULT_PINS.get(("draft", "fp8", "wg_waves"))
+    ):
+        # DEC20-PROMOTE: an entry-pinned fp8 draft wg_waves 4 replaces the default-env
+        # wrapper's 'auto' value 2 (any other env-applied value still mismatches)
+        rk = dict(rk, wg_waves=wk["wg_waves"])
     return rb == wb and (not rk or rk == wk)
 
 
@@ -1217,10 +1233,11 @@ def _variant_spec(vid: str, params, is_fp8: bool):
             (is_fp8, div, str(params["k_load"]), int(params["wave_cols"])),
         )
     if vid == "qsa.page4.decg.v1":
+        # DEC20-PROMOTE: a pinned ``wc`` (fp8 4-row groups: 32) is the launch's slab
         return (
             "decg",
             "_build_decode_group_kernel",
-            (is_fp8, div, int(params["wave_cols"])),
+            (is_fp8, div, int(params.get("wc") or params["wave_cols"])),
         )
     if not is_fp8 and vid == "qsa.page4.r32_persist.v1":
         return "wmma", "_build_wmma_kernel", (div, 32, "persist")

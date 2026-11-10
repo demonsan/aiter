@@ -1336,7 +1336,9 @@ class Rules(Env):
     def setUp(self):
         super().setUp()
         with open(PROFILE_JSON, encoding="utf-8") as fh:
-            self.data = json.load(fh)
+            # DEC20-PROMOTE: the knob-pinned overlay rules / buckets (pending until the GPU
+            # check; op_tests/test_qsa_dec20p_cpu.py) are not part of these legacy checks
+            self.data = _gen().strip_dec20p(json.load(fh))
         self._td = _tmpdir()
         self.td = self._td.__enter__()
         d = _verified_rules(self.data)
@@ -2447,7 +2449,10 @@ class Dispatch(_Stubs):
         """Rule samples (allow_unverified sweep path) launch exactly the rule's variant."""
         prof = PR.load_profile(PR.DEFAULT_PROFILE)
         n = 0
+        overlays = _gen().dec20p_ids()  # DEC20-PROMOTE: test_qsa_dec20p_cpu.py
         for rule in prof.rules:
+            if rule.id in overlays:
+                continue
             small = [
                 s
                 for s in rule.raw["samples"]

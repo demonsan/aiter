@@ -342,16 +342,20 @@ def page_of(entry: Mapping[str, Any]) -> int:
 #: low-latency-prologue specializations of the draft / decode-group kernels (builder keyword ``ll``; kernel ``DEC20_LL`` block); 0 (absent)
 #: = the existing kernels. ``slabs`` 2 / 4 (decode group only) = multi-slab waves with a
 #: double-buffered K gather (kernel ``DECG_SLABS``); 1 (absent) = the existing kernels.
+#: ROUND-DEC20B: decode-group ``ll`` 3 (speculative group request, slabs 1 only) and ``fk``
+#: 1 (fp8 fast K: early K scales + 8-byte K fragment loads; fp8 caches with ll >= 1 only;
+#: kernel ``DEC20B_FK``), draft and decode group; 0 (absent) = the existing kernels.
 LAUNCH_KNOBS: dict[str, dict[str, tuple]] = {
-    "draft": {"wg_waves": (4, 2, 1), "ll": (0, 1, 2, 3)},
+    "draft": {"wg_waves": (4, 2, 1), "ll": (0, 1, 2, 3), "fk": (0, 1)},
     "decg": {
         "wg_waves": (4, 2, 1),
         "group_rows": (4, 3),
-        "ll": (0, 1, 2),
+        "ll": (0, 1, 2, 3),
         "slabs": (1, 2, 4),
+        "fk": (0, 1),
     },
 }
-KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1}
+KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1, "fk": 0}
 
 
 def variant_kind(vid: str) -> str:

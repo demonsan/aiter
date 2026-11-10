@@ -317,6 +317,10 @@ def _knob_kw(vid: str, params) -> dict:
     # exact pre-DEC20 builder keywords / lru entries)
     llv = int(knobs.get("ll", P.KNOB_DEFAULTS["ll"]))
     ll = {"ll": llv} if llv else {}
+    # ROUND-DEC20B: fp8 fast K (keyword only when pinned on)
+    fkv = int(knobs.get("fk", P.KNOB_DEFAULTS["fk"]))
+    if fkv:
+        ll["fk"] = fkv
     if kind == "draft":
         return {"wg_waves": w, **ll}
     g = int(knobs.get("group_rows", P.KNOB_DEFAULTS["group_rows"]))
@@ -338,7 +342,7 @@ def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
     rb, rk = P.split_knobs(vid, params)
     wb, wk = P.split_knobs(want_vid, want_params)
     # ROUND-DEC20: ``ll`` / ``slabs`` are never applied by the environment (entry-pinned)
-    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs")}
+    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs", "fk")}  # + DEC20B fk
     return rb == wb and (not rk or rk == wk)
 
 

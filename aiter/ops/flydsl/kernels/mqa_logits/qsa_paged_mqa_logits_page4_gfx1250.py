@@ -616,6 +616,24 @@ def _pin_sgprs(vals):
     )
 
 
+def _pin_vgprs(vals):
+    """DEC20B: empty side-effecting inline asm reading ``vals`` as VGPR operands -- keeps
+    the loads that produce them in the prologue batch (LLVM's machine sinker otherwise moves
+    loads used by one branch into it, i.e. behind the branch's own dependent round trip)."""
+    from flydsl._mlir.dialects import llvm
+
+    vals = list(vals)
+    if not vals:
+        return
+    llvm.inline_asm(
+        None,
+        [fx.Int32(v).ir_value() for v in vals],
+        "; dec20b pin",
+        ",".join(["v"] * len(vals)),
+        has_side_effects=True,
+    )
+
+
 def _inst_prefetch(kb):
     """Prefetch ``kb`` KiB of code starting at this point (4 KiB per instruction)."""
     if not kb:
@@ -6192,6 +6210,58 @@ def _ll_tag(ll: int) -> str:
     return {0: "", 1: "_ll", 2: "_ll2", 3: "_ll3"}[ll]
 
 
+# ROUND-DEC20B (DEC20B_FK): fp8 "fast K" builder keyword ``fk`` of the draft and decode-group
+# kernels (default 0 = unchanged kernels, same names; 1 = kernel name suffix ``_fk``; fp8 + ll >= 1
+# only). The DEC20 no-device ISA of the fp8 ll kernels shows two avoidable latencies AFTER the K
+# gather (`scripts/dec20/isa_chain.py`):
+#   * the per-column K scale (``KS[phys * P + c % P]``) is a lane VMEM load issued only after
+#     ``s_wait_tensorcnt`` (decode group) or after the last WMMA, behind a late kernarg
+#     ``s_load`` of the KS base (draft: kernarg -> scale -> store = 2 dependent trips at the tail);
+#     fk issues it in the prologue, right after the lane page ids (``pre``), so it lands under
+#     the gather;
+#   * each fp8 K fragment was two 16-byte ``ds_load_b128`` + a kgrp ``v_cndmask`` per dword (half
+#     of every load discarded) and the decode group interleaved them one-by-one with the
+#     conversions (``s_wait_dscnt 0x1`` after each: a serialized LDS latency chain, ~16 per slab);
+#     fk reads exactly the lane's 8 + 8 bytes (two ``ds_load_b64`` at ``+ kgrp * 8``: same bytes,
+#     same converter, same WMMA operands -> bit-identical results) and, in the decode group,
+#     issues every K fragment load of the slab before the first conversion (``sched_barrier``).
+FK_MODES = (0, 1)
+
+
+def _check_fk(fk, is_fp8: bool, ll: int) -> int:
+    v = int(fk)
+    if v not in FK_MODES:
+        raise ValueError(f"fk must be one of {FK_MODES}")
+    if v and not is_fp8:
+        raise ValueError("fk (fp8 fast K) applies to fp8 caches only")
+    if v and not ll:
+        raise ValueError("fk needs the ll >= 1 prologue (lane page ids loaded early)")
+    return v
+
+
+def _fk_tag(fk: int) -> str:
+    return "_fk" if fk else ""
+
+
+def _kraw_fp8_fk(src, byte_off, kgrp):
+    """DEC20B fk: the lane's 2 x 8 fp8 bytes of one K step from the TDM tile (two ds_load_b64
+    at ``byte_off + kgrp * 8`` and ``+ 16``) -- the dwords the b128 path selects by kgrp."""
+    off = byte_off + kgrp * 8
+    lo = Vec(fx.ptr_load(src + off // 4, result_type=Vec.make_type(2, fx.Int32)))
+    hi = Vec(fx.ptr_load(src + (off + 16) // 4, result_type=Vec.make_type(2, fx.Int32)))
+    return lo, hi
+
+
+def _kcvt_fp8_fk(raw):
+    """DEC20B fk: convert one ``_kraw_fp8_fk`` pair to the 8-dword bf16 WMMA B operand."""
+    words = []
+    for vec in raw:
+        cvt = _e4m3x8_to_bf16x4_fast(fx.Int32(vec[0]), fx.Int32(vec[1]))
+        for j in range(4):
+            words.append(fx.Int32(cvt[j]))
+    return Vec.from_elements(words, dtype=fx.Int32)
+
+
 def _readlane_i32(x, lane: int):
     from flydsl._mlir.dialects import llvm
 
@@ -6371,6 +6441,7 @@ def _build_draft_kernel(
     page_size: int = PAGE_SIZE,
     wg_waves: int = DRAFT_WAVES,
     ll: int = 0,
+    fk: int = 0,
 ):
     """One-row-per-wave draft specialization (see the Round DRAFT block).
 
@@ -6387,11 +6458,14 @@ def _build_draft_kernel(
     P = _check_page_size(page_size)
     waves = int(wg_waves)
     ll = _check_ll(ll)
+    fk = _check_fk(fk, is_fp8, ll)
     if waves not in _WG_WAVES:
         raise ValueError(f"draft wg_waves must be one of {_WG_WAVES}")
     threads = WMMA_WAVE * waves
     if k_load not in ("tdm", "raw"):
         raise ValueError("draft k_load must be 'tdm' or 'raw'")
+    if fk and (k_load != "tdm" or _FP8_CVT_ASM):
+        raise ValueError("draft fk needs k_load='tdm' and the intrinsic fp8 converter")
     if wave_cols not in (32, 64):
         raise ValueError("draft wave_cols must be 32 or 64")
     if _ACCESS != "raw":
@@ -6429,6 +6503,7 @@ def _build_draft_kernel(
         + sched_tag
         + (f"_wg{waves}" if waves != DRAFT_WAVES else "")
         + _ll_tag(ll)
+        + _fk_tag(fk)
     )
 
     def _frag(rsrc, byte_off):
@@ -6470,18 +6545,51 @@ def _build_draft_kernel(
             out.append((page_ok.select(phys, 0), page_ok))
         return out
 
-    def _pre_none(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, nreq):
+    def _pre_none(
+        pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, nreq, **_kw
+    ):
         return None
 
-    def _pre_ll(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, nreq):
+    def _pre_ll(
+        pt_rsrc,
+        safe_req,
+        req_ok,
+        col0,
+        n_in,
+        width,
+        num_pages,
+        nreq,
+        ks_rsrc=None,
+        lane=None,
+    ):
         rids = (
             _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages, nreq)
             if use_tdm
             else None
         )
-        return rids, _lane_pages(
-            pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages
-        )
+        lp = _lane_pages(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages)
+        if not fk or ks_rsrc is None:
+            return rids, lp
+        return _add_scales_d((rids, lp), ks_rsrc, col0, lane)
+
+    def _add_scales_d(pre, ks_rsrc, col0, lane):
+        # DEC20B_FK: the K scale of each store pair (the _values / finish math) in flight
+        # under the gather instead of after the last WMMA.
+        lp = pre[1]
+        g0 = (lane // WMMA_N) == 0
+        scales = []
+        for j in range_constexpr(n_pairs):
+            phys = g0.select(lp[2 * j][0], lp[2 * j + 1][0])
+            c = col0 + j * WMMA_WAVE + lane
+            scales.append(_ld_f32(ks_rsrc, (phys * P + c % P) * 4))
+        return pre[0], lp, scales
+
+    def _spec_fk_d(pre_s, ks_rsrc, col0, lane):
+        """fk ll=3: page ids pinned in the prologue batch, then the scale loads."""
+        if not fk:
+            return pre_s
+        _pin_vgprs([pg[0] for pg in pre_s[1]])
+        return _add_scales_d(pre_s, ks_rsrc, col0, lane)
 
     def _q_early_none(q_rsrc, row, rows, n_in, kgrp):
         return None
@@ -6604,6 +6712,19 @@ def _build_draft_kernel(
                 words.append(fx.Int32(cvt[j]))
         return Vec.from_elements(words, dtype=fx.Int32)
 
+    def _kfrag_fp8_fk(src, byte_off, kgrp):  # DEC20B_FK: 2 x ds_load_b64, no select
+        return _kcvt_fp8_fk(_kraw_fp8_fk(src, byte_off, kgrp))
+
+    def _finish_fp8_scaled(acc, scale):  # DEC20B_FK: _finish_fp8 with the early scale
+        zero = fx.Float32(0.0)
+        s = (
+            (acc[0] * scale).maximumf(zero)
+            + (acc[1] * scale).maximumf(zero)
+            + (acc[2] * scale).maximumf(zero)
+            + (acc[3] * scale).maximumf(zero)
+        )
+        return s * inv_divisor
+
     def _ks_bytes_fp8(num_pages):
         return _plane_bytes(num_pages, P * 4)
 
@@ -6653,6 +6774,8 @@ def _build_draft_kernel(
     kbase = _kbase_tdm if use_tdm else _kbase_raw
     if is_fp8:
         kfrag = _kfrag_fp8_tdm if use_tdm else _kfrag_fp8_raw
+        if fk:
+            kfrag = _kfrag_fp8_fk
         ks_bytes, finish = _ks_bytes_fp8, _finish_fp8
     else:
         kfrag = _kfrag_bf16_tdm if use_tdm else _kfrag_bf16_raw
@@ -6820,7 +6943,10 @@ def _build_draft_kernel(
             ok = g0.select(oks[2 * j], oks[2 * j + 1]) != 0
             phys = g0.select(physs[2 * j], physs[2 * j + 1])
             c = col0 + j * WMMA_WAVE + lane
-            score = finish(acc, ks_rsrc, phys, c % P)
+            if pre is not None and len(pre) > 2:  # DEC20B_FK: scale loaded early
+                score = _finish_fp8_scaled(acc, pre[2][j])
+            else:
+                score = finish(acc, ks_rsrc, phys, c % P)
             out.append((ok & (c < vis)).select(score, neg_inf))
         return out
 
@@ -6869,7 +6995,16 @@ def _build_draft_kernel(
         safe_req = req_ok.select(req, 0)
         # ROUND-DEC20 ll: page-table lookups as soon as the request is known; ll=0: no ops.
         pre = pre_fn(
-            pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, num_requests
+            pt_rsrc,
+            safe_req,
+            req_ok,
+            col0,
+            n_in,
+            width,
+            num_pages,
+            num_requests,
+            ks_rsrc=ks_rsrc,
+            lane=lane,
         )
         ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
         pos = ld_uniform_pos(qp_rsrc, safe_row)
@@ -6969,7 +7104,14 @@ def _build_draft_kernel(
         spec = _imax(_imin(safe_row, num_requests - 1), 0)
         spec_ok = (spec >= 0) & (spec < num_requests)
         pre_s = _pre_ll(
-            pt_rsrc, spec, spec_ok, col0, n_in, width, num_pages, num_requests
+            pt_rsrc,
+            spec,
+            spec_ok,
+            col0,
+            n_in,
+            width,
+            num_pages,
+            num_requests,
         )
         ctx_s = _readfirstlane_i32(_ld_i32(cl_rsrc, spec * 4))
         pos = _readfirstlane_i32(ld_lane_pos(qp_rsrc, safe_row))
@@ -6978,6 +7120,7 @@ def _build_draft_kernel(
         safe_req = req_ok.select(req, 0)
         hit = req_ok & (req == spec)
         miss = hit == 0
+        pre_s = _spec_fk_d(pre_s, ks_rsrc, col0, lane)
         vis_s = _imax(_imin(pos + 1, ctx_s), 0) // COMPRESS_RATIO
         writer = (bx == 0) & (tid == 0) & (row < rows)
         out_cols, out_offs = _out_plan(col0, lane, safe_row, rows, columns)
@@ -7036,7 +7179,16 @@ def _build_draft_kernel(
             ctx_m = _ld_uniform_i32(cl_rsrc, safe_req * 4)
             vis_m = req_ok.select(_imax(_imin(pos + 1, ctx_m), 0) // COMPRESS_RATIO, 0)
             pre_m = _pre_ll(
-                pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, num_requests
+                pt_rsrc,
+                safe_req,
+                req_ok,
+                col0,
+                n_in,
+                width,
+                num_pages,
+                num_requests,
+                ks_rsrc=ks_rsrc,
+                lane=lane,
             )
             if writer:
                 _st_i32(vis_rsrc, safe_row * 4, vis_m)
@@ -7135,6 +7287,7 @@ def _build_draft_kernel(
     launch.cols_per_block = span
     launch.wave_cols = wave_cols
     launch.k_load = k_load
+    launch.fk = fk
     return launch
 
 
@@ -7433,6 +7586,7 @@ def _build_decode_group_kernel(
     wg_waves: int = DECG_WAVES,
     ll: int = 0,
     slabs: int = 1,
+    fk: int = 0,
 ):
     """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
 
@@ -7447,11 +7601,12 @@ def _build_decode_group_kernel(
     P = _check_page_size(page_size)
     group_rows, row_mode, waves = _check_decg_knobs(group_rows, row_mode, wg_waves)
     ll = _check_ll(ll)
-    if ll == 3:
-        raise ValueError("decode-group ll must be 0, 1 or 2 (ll=3 is draft-only)")
     slabs = int(slabs)
     if slabs not in DECG_SLABS:
         raise ValueError(f"decode-group slabs must be one of {DECG_SLABS}")
+    if ll == 3 and slabs != 1:  # DEC20B: speculative group request, single-slab body only
+        raise ValueError("decode-group ll=3 (speculative group request) requires slabs=1")
+    fk = _check_fk(fk, is_fp8, ll)
     if slabs > 1 and wave_cols != 32:
         # no-device builds: fp8 w64 x 2 slabs needs 241-252 VGPRs, x 4 slabs 265-290
         # (> 256: VGPR-MSB addressing, WMMA hazards in the scan) -> 32-column slabs only
@@ -7481,6 +7636,8 @@ def _build_decode_group_kernel(
     gather = _tdm_fp8_k_gather if is_fp8 else _tdm_k_gather
     dtag = "fp8" if is_fp8 else "bf16"
     sched = decg_fp8_sched() if is_fp8 else "base"  # ROUND-FP8PERF; bf16 unchanged
+    if fk and (sched != "base" or _FP8_CVT_ASM):
+        raise ValueError("decode-group fk needs the base fp8 schedule (intrinsic converter)")
     sched_tag = (
         f"_s{sched}"
         if (is_fp8 and not _FP8_CVT_ASM and sched != _DECG_FP8_SCHED_DEFAULT)
@@ -7497,6 +7654,7 @@ def _build_decode_group_kernel(
         + _decg_knob_tag(group_rows, row_mode, waves)
         + _ll_tag(ll)
         + (f"_ms{slabs}" if slabs != 1 else "")
+        + _fk_tag(fk)
     )
 
     def _i01(cond):
@@ -7538,7 +7696,7 @@ def _build_decode_group_kernel(
     def _meta_lanes_none(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, n, lane):
         return None
 
-    meta_lanes_fn = _meta_lanes if ll == 2 else _meta_lanes_none
+    meta_lanes_fn = _meta_lanes if ll >= 2 else _meta_lanes_none
 
     def _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, vm=None):
         """SGPR metadata of the group's 4 rows (clamped loads)."""
@@ -7829,17 +7987,28 @@ def _build_decode_group_kernel(
             out.append((page_ok.select(phys, 0), page_ok))
         return out
 
-    def _pres_none(pt_rsrc, plans, col0, n_in, width, num_pages, nreq):
+    def _pres_none(pt_rsrc, plans, col0, n_in, width, num_pages, nreq, ks_rsrc=None):
         return [None] * n_pass
 
-    def _pres_ll(pt_rsrc, plans, col0, n_in, width, num_pages, nreq):
+    def _pres_ll(pt_rsrc, plans, col0, n_in, width, num_pages, nreq, ks_rsrc=None):
         pp = plans[0]
         cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
         pre0 = (
             _rowids_pass(pt_rsrc, pp, col0, width, num_pages, nreq),
             _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages),
         )
+        if fk and ks_rsrc is not None:  # DEC20B_FK: tiles' K scales under the gather
+            pre0 = _add_scales(pre0, ks_rsrc, col0, n_in)
         return [pre0] + [None] * (n_pass - 1)
+
+    def _add_scales(pre0, ks_rsrc, col0, n_in):
+        cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
+        return pre0 + (
+            [
+                _ld_f32(ks_rsrc, (pre0[1][nt][0] * P + cols[nt] % P) * 4)
+                for nt in range_constexpr(n_tiles)
+            ],
+        )
 
     def _q_early_none(q_rsrc, t0, rows, n_in, kgrp):
         return None
@@ -7972,11 +8141,20 @@ def _build_decode_group_kernel(
                 page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
                 phys = page_ok.select(phys, 0)
             k_base = local * pitch + pp.kgrp * kgrp_bytes
-            kf = [
-                kfrag(ksrc, k_base + s * kstep_k, pp.kgrp)
-                for s in range_constexpr(WMMA_K_STEPS)
-            ]
-            scale = scale_fn(ks_rsrc, phys, off)
+            if fk:  # DEC20B_FK: raw fp8 fragments only (converted after the batch)
+                kf = [
+                    _kraw_fp8_fk(ksrc, k_base + s * kstep_k, pp.kgrp)
+                    for s in range_constexpr(WMMA_K_STEPS)
+                ]
+            else:
+                kf = [
+                    kfrag(ksrc, k_base + s * kstep_k, pp.kgrp)
+                    for s in range_constexpr(WMMA_K_STEPS)
+                ]
+            if pre is not None and len(pre) > 2:  # DEC20B_FK: scale loaded early
+                scale = pre[2][nt]
+            else:
+                scale = scale_fn(ks_rsrc, phys, off)
             return kf, page_ok, scale
 
         def _tile_mma(kf):
@@ -7997,10 +8175,18 @@ def _build_decode_group_kernel(
                 if nt > 0:
                     accs.append(_tile_mma(tiles[nt - 1][0]))
                 fx.rocdl.sched_barrier(0)
+        elif fk:
+            # DEC20B_FK: every K fragment load of the slab issued, then convert + WMMA
+            tiles = [_tile_k(nt) for nt in range_constexpr(n_tiles)]
+            fx.rocdl.sched_barrier(0)
+            accs = [
+                _tile_mma([_kcvt_fp8_fk(r) for r in tiles[nt][0]])
+                for nt in range_constexpr(n_tiles)
+            ]
         out = []
         for nt in range_constexpr(n_tiles):
             c = cols[nt]
-            if sched == "kpipe":
+            if sched == "kpipe" or fk:
                 page_ok, scale, acc = tiles[nt][1], tiles[nt][2], accs[nt]
             else:
                 kf, page_ok, scale = _tile_k(nt)
@@ -8068,7 +8254,9 @@ def _build_decode_group_kernel(
         )
         # ROUND-DEC20 ll: pass 0's page-table lookups right after the metadata loads
         # are issued (ll=0: [None] * passes, no ops).
-        pres = pres_fn(pt_rsrc, plans, col0, n_in, width, num_pages, num_requests)
+        pres = pres_fn(
+            pt_rsrc, plans, col0, n_in, width, num_pages, num_requests, ks_rsrc=ks_rsrc
+        )
         if writer:
             _st_i32(vis_rsrc, meta_off, my_vis)
             _st_i32(rst_rsrc, meta_off, fx.Int32(0))
@@ -8143,9 +8331,11 @@ def _build_decode_group_kernel(
             offss.append(_store_offsets(t0, kgrp, cols, rows, columns))
         return colss, offss
 
-    def _slab_pres(pt_rsrc, plans, c0s, n_in, width, num_pages, nreq):
+    def _slab_pres(pt_rsrc, plans, c0s, n_in, width, num_pages, nreq, ks_rsrc=None):
         return [
-            pres_fn(pt_rsrc, plans, c0s[s], n_in, width, num_pages, nreq)
+            pres_fn(
+                pt_rsrc, plans, c0s[s], n_in, width, num_pages, nreq, ks_rsrc=ks_rsrc
+            )
             for s in range_constexpr(slabs)
         ]
 
@@ -8208,7 +8398,9 @@ def _build_decode_group_kernel(
             t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
         )
         c0s, c0n = _slab_cols(bx, wave)
-        presl = _slab_pres(pt_rsrc, plans, c0s, n_in, width, num_pages, num_requests)
+        presl = _slab_pres(
+            pt_rsrc, plans, c0s, n_in, width, num_pages, num_requests, ks_rsrc=ks_rsrc
+        )
         if writer:
             _st_i32(vis_rsrc, meta_off, my_vis)
             _st_i32(rst_rsrc, meta_off, fx.Int32(0))
@@ -8280,7 +8472,238 @@ def _build_decode_group_kernel(
                             if msk[j2][0]:
                                 _st_f32(logits_rsrc, msk[j2][1], neg_inf)
 
-    selected_kernel = kernel_ms if slabs > 1 else kernel
+    # ---- ROUND-DEC20B ll=3: speculative group request (DEC20B_SPEC; slabs == 1) ------
+    # MTP verify / decode batches put each request's rows in consecutive groups of
+    # ``group_rows`` (trace4: t2r[row] = row // 4, verify3 g3: row // 3), so group ``grp``
+    # usually IS request ``grp``. The prologue issues, in ONE batch after the kernarg loads:
+    # Q fragments, the group rows' token_to_request + positions (one lane load each),
+    # context_lens[spec] and pass 0's page-table loads (row ids + lane page ids [+ fk
+    # scales]) for spec = min(grp, requests - 1). ``hit`` = every (clamped) group row maps to
+    # spec: the metadata built with context_lens[spec] is then exactly the ll=2 metadata
+    # (rows with an invalid request get visible 0 either way) and only pass 0 can be active,
+    # so the hit path is pass 0 of the ll=2 kernel with the speculative loads. ``miss`` runs
+    # the complete ll=2 body (all passes) with the real requests: exact for any
+    # token_to_request. Dependent round trips before the gather: 1 (ll=2: 2).
+    class _SpecReq:
+        def __init__(self, safe_req, req_ok, kgrp):
+            self.safe_req, self.req_ok, self.kgrp = safe_req, req_ok, kgrp
+
+    def _spec_loads(t2r_rsrc, qp_rsrc, t0, rows, lane):
+        lrow = _imin(t0 + _imin(lane, group_rows - 1), rows - 1)
+        return _ld_i32(t2r_rsrc, lrow * 4), ld_lane_pos(qp_rsrc, lrow)
+
+    def _vm_spec(req_l, pos_l, ctx_s):
+        return [
+            (_readlane_i32(req_l, i), ctx_s, _readlane_i32(pos_l, i))
+            for i in range(group_rows)
+        ]
+
+    def _spec_fk(pres_s, ks_rsrc, col0, n_in):
+        """fk: lane page ids pinned in the prologue batch (not sunk into the hit branch
+        behind a wait), then the tiles' scale loads (they depend on the page ids)."""
+        if not fk:
+            return pres_s
+        _pin_vgprs([pg[0] for pg in pres_s[0][1]])
+        return [_add_scales(pres_s[0], ks_rsrc, col0, n_in)] + pres_s[1:]
+
+    def _spec_hit(vm, spec, spec_ok):
+        hit = spec_ok
+        for i in range(group_rows):
+            hit = hit & (vm[i][0] == spec)
+        return hit
+
+    def _head_vm(t0, rows, num_requests, kgrp, lane, bx, wave, vm):
+        """``group_head`` with the given lane metadata (no loads)."""
+        if row_mode == "base":
+            meta = _group_meta(None, None, None, t0, rows, num_requests, vm)
+            plans = _group_plans(meta, kgrp)
+            my_vis = _pick_vis(lane, meta)
+            my_row = t0 + _imin(lane, DECG_ROWS - 1)
+            writer = (bx == 0) & (wave == 0) & (lane < DECG_ROWS) & (my_row < rows)
+        else:
+            meta = _group_meta_x(None, None, None, t0, rows, num_requests, vm)
+            plans = _group_plans_x(meta, kgrp)
+            my_vis = _pick_vis_x(lane, meta)
+            my_row = t0 + _imin(lane, group_rows - 1)
+            writer = _writer_x(lane, meta, bx, wave, my_row, rows)
+        return plans, my_vis, _imin(my_row, rows - 1) * 4, writer
+
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
+    def kernel_spec(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bx = fx.Int32(fx.block_idx.x)
+        grp = fx.Int32(fx.block_idx.y)
+        wave = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        t0 = grp * group_rows
+        col0 = bx * span + wave * wave_cols
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        _kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        q_early = _q_early_ll(q_rsrc, t0, rows, n_in, kgrp)
+        spec = _imax(_imin(grp, num_requests - 1), 0)
+        spec_ok = (spec >= 0) & (spec < num_requests)
+        req_l, pos_l = _spec_loads(t2r_rsrc, qp_rsrc, t0, rows, lane)
+        ctx_l = _ld_i32(cl_rsrc, spec * 4)
+        pres_s = pres_fn(
+            pt_rsrc,
+            [_SpecReq(spec, spec_ok, kgrp)],
+            col0,
+            n_in,
+            width,
+            num_pages,
+            num_requests,
+        )
+        vm_s = _vm_spec(req_l, pos_l, _readfirstlane_i32(ctx_l))
+        hit = _spec_hit(vm_s, spec, spec_ok)
+        miss = hit == 0
+        pres_s = _spec_fk(pres_s, ks_rsrc, col0, n_in)
+        plans_h, my_vis_h, meta_off_h, writer_h = _head_vm(
+            t0, rows, num_requests, kgrp, lane, bx, wave, vm_s
+        )
+        pp_h = plans_h[0]
+        atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
+        )
+        cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
+        offs = _store_offsets(t0, kgrp, cols, rows, columns)
+        neg_inf = fx.Float32(_NEG_INF)
+        storage = _storage()
+        ksrc = storage + wave * (tile_bytes // 4)
+        # (the two blocks are exclusive; LLVM lays the hit block out after the miss body as
+        # a taken branch whatever their source order or an llvm.expect hint -- no-device ISA)
+        if miss:
+            plans_m, my_vis_m, meta_off_m, writer_m = group_head(
+                t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
+            )
+            pres_m = pres_fn(
+                pt_rsrc,
+                plans_m,
+                col0,
+                n_in,
+                width,
+                num_pages,
+                num_requests,
+                ks_rsrc=ks_rsrc,
+            )
+            if writer_m:
+                _st_i32(vis_rsrc, meta_off_m, my_vis_m)
+                _st_i32(rst_rsrc, meta_off_m, fx.Int32(0))
+            for p in range_constexpr(n_pass):
+                pp_m = plans_m[p]
+                if pp_m.active:
+                    if col0 < pp_m.vmax:
+                        _issue(
+                            KV,
+                            storage,
+                            pt_rsrc,
+                            pp_m,
+                            col0,
+                            width,
+                            num_pages,
+                            wave,
+                            pres_m[p],
+                        )
+                        _tensor_done()
+                        res_m = _pass_values(
+                            atom,
+                            ksrc,
+                            ks_rsrc,
+                            pt_rsrc,
+                            q_early,
+                            pp_m,
+                            col0,
+                            cols,
+                            offs,
+                            n_in,
+                            columns,
+                            width,
+                            num_pages,
+                            pres_m[p],
+                        )
+                        for j3 in range_constexpr(len(res_m)):
+                            if res_m[j3][0]:
+                                _st_f32(logits_rsrc, res_m[j3][1], res_m[j3][2])
+                        _war_guard()
+                    if col0 >= pp_m.vmax:
+                        msk_m = _pass_masks(pp_m, cols, offs, columns)
+                        for j4 in range_constexpr(len(msk_m)):
+                            if msk_m[j4][0]:
+                                _st_f32(logits_rsrc, msk_m[j4][1], neg_inf)
+        if hit:
+            if writer_h:
+                _st_i32(vis_rsrc, meta_off_h, my_vis_h)
+                _st_i32(rst_rsrc, meta_off_h, fx.Int32(0))
+            if pp_h.active:
+                if col0 < pp_h.vmax:
+                    _issue(
+                        KV,
+                        storage,
+                        pt_rsrc,
+                        pp_h,
+                        col0,
+                        width,
+                        num_pages,
+                        wave,
+                        pres_s[0],
+                    )
+                    _tensor_done()
+                    res_h = _pass_values(
+                        atom,
+                        ksrc,
+                        ks_rsrc,
+                        pt_rsrc,
+                        q_early,
+                        pp_h,
+                        col0,
+                        cols,
+                        offs,
+                        n_in,
+                        columns,
+                        width,
+                        num_pages,
+                        pres_s[0],
+                    )
+                    for j1 in range_constexpr(len(res_h)):
+                        if res_h[j1][0]:
+                            _st_f32(logits_rsrc, res_h[j1][1], res_h[j1][2])
+                if col0 >= pp_h.vmax:
+                    msk_h = _pass_masks(pp_h, cols, offs, columns)
+                    for j2 in range_constexpr(len(msk_h)):
+                        if msk_h[j2][0]:
+                            _st_f32(logits_rsrc, msk_h[j2][1], neg_inf)
+
+    if slabs > 1:
+        selected_kernel = kernel_ms
+    elif ll == 3:
+        selected_kernel = kernel_spec
+    else:
+        selected_kernel = kernel
 
     @flyc.jit
     def launch(
@@ -8328,6 +8751,7 @@ def _build_decode_group_kernel(
 
     launch.kernel_name = kernel_name
     launch.dtype_tag = f"{dtag}_decg"
+    launch.fk = fk
     launch.cols_per_block = span
     launch.wave_cols = wave_cols
     launch.group_rows = group_rows

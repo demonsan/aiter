@@ -6171,7 +6171,14 @@ _DRAFT_WG_WAVES = None if _DRAFT_WG_WAVES_SPEC == "auto" else int(_DRAFT_WG_WAVE
 #         s_buffer_load is readnone; one round trip there instead of n);
 #   ll=2  vector ``buffer_load_b{64,128}`` (uniform address) + ``v_readfirstlane`` -- a
 #         memory read the machine sinker keeps in the prologue (issued with ctx / pos).
-LL_MODES = (0, 1, 2)
+#   ll=3  (draft only) ll=2 + speculative request id: the draft regime (rows <= requests) is
+#         one row per request with token_to_request[row] == row in decode batches, so the
+#         page-table / context_lens loads of request min(row, requests - 1) are issued
+#         together with the token_to_request load (vector loads + readfirstlane); a uniform
+#         branch takes that path when token_to_request[row] equals it, else the ll=2 path with
+#         the real request (exact for any token_to_request). Dependent round trips before the
+#         gather: 1 (kernarg -> {t2r, page table, ctx, pos, Q}).
+LL_MODES = (0, 1, 2, 3)
 
 
 def _check_ll(ll) -> int:
@@ -6182,7 +6189,7 @@ def _check_ll(ll) -> int:
 
 
 def _ll_tag(ll: int) -> str:
-    return {0: "", 1: "_ll", 2: "_ll2"}[ll]
+    return {0: "", 1: "_ll", 2: "_ll2", 3: "_ll3"}[ll]
 
 
 def _readlane_i32(x, lane: int):
@@ -6256,7 +6263,7 @@ def _wide_row_ids(
         n_ent, first = n_groups, col0 // 8
     else:
         n_ent, first = max(1, n_groups // 2), col0 // 16
-    vector = ll == 2
+    vector = ll >= 2
     chunk = 4 if vector else 8
     total = _imax(num_requests, 1) * width
     ents = []
@@ -6376,7 +6383,7 @@ def _build_draft_kernel(
     and the lanes' page ids) issued as soon as the request id is known -- not
     behind the context / position loads and the visible-columns branch.
     """
-    _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
+    ld_lane_pos, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
     P = _check_page_size(page_size)
     waves = int(wg_waves)
     ll = _check_ll(ll)
@@ -6634,7 +6641,9 @@ def _build_draft_kernel(
         return cols, [_imin(safe_row * columns + c, last) * 4 for c in cols]
 
     if ll and sched not in ("base", "qpre"):
-        raise ValueError(f"draft ll=1 supports the base / qpre schedules, not {sched!r}")
+        raise ValueError(
+            f"draft ll=1 supports the base / qpre schedules, not {sched!r}"
+        )
     pre_fn = _pre_ll if ll else _pre_none
     q_early_fn = _q_early_ll if ll else _q_early_none
     storage_fn = _storage_tdm if use_tdm else _storage_raw
@@ -6657,7 +6666,9 @@ def _build_draft_kernel(
 
     def _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early=None):
         """K staging wait + Q fragments, in the schedule's order (plain Python)."""
-        if q_early is not None:  # ROUND-DEC20 ll: Q already in flight since the prologue
+        if (
+            q_early is not None
+        ):  # ROUND-DEC20 ll: Q already in flight since the prologue
             stage_wait()
             return q_early
         if sched == "base":
@@ -6877,7 +6888,16 @@ def _build_draft_kernel(
         live = (col0 < vis) & (row < rows)
         if live:
             stage(
-                KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave, pre
+                KV,
+                storage,
+                pt_rsrc,
+                safe_req,
+                req_ok,
+                col0,
+                width,
+                num_pages,
+                wave,
+                pre,
             )
             qf = _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early)
             vals = _values(
@@ -6907,6 +6927,164 @@ def _build_draft_kernel(
                 if out_cols[j2] < columns:
                     _st_f32(logits_rsrc, out_offs[j2], neg_inf)
 
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
+    def kernel_spec(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        # ROUND-DEC20 ll=3: speculative request id (see the DEC20_LL block).
+        tid = fx.Int32(fx.thread_idx.x)
+        bx = fx.Int32(fx.block_idx.x)
+        row = fx.Int32(fx.block_idx.y)
+        wave = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        col0 = bx * span + wave * wave_cols
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        q_early = _q_early_ll(q_rsrc, row, rows, n_in, kgrp)
+        safe_row = _imin(row, rows - 1)
+        spec = _imax(_imin(safe_row, num_requests - 1), 0)
+        spec_ok = (spec >= 0) & (spec < num_requests)
+        pre_s = _pre_ll(
+            pt_rsrc, spec, spec_ok, col0, n_in, width, num_pages, num_requests
+        )
+        ctx_s = _readfirstlane_i32(_ld_i32(cl_rsrc, spec * 4))
+        pos = _readfirstlane_i32(ld_lane_pos(qp_rsrc, safe_row))
+        req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
+        req_ok = (req >= 0) & (req < num_requests)
+        safe_req = req_ok.select(req, 0)
+        hit = req_ok & (req == spec)
+        miss = hit == 0
+        vis_s = _imax(_imin(pos + 1, ctx_s), 0) // COMPRESS_RATIO
+        writer = (bx == 0) & (tid == 0) & (row < rows)
+        out_cols, out_offs = _out_plan(col0, lane, safe_row, rows, columns)
+        storage = storage_fn(kv_rsrc)
+        ksrc = wave_src(storage, wave)
+        atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
+        )
+        neg_inf = fx.Float32(_NEG_INF)
+        if hit:
+            if writer:
+                _st_i32(vis_rsrc, safe_row * 4, vis_s)
+                _st_i32(rst_rsrc, safe_row * 4, fx.Int32(0))
+            live_h = (col0 < vis_s) & (row < rows)
+            if live_h:
+                stage(
+                    KV,
+                    storage,
+                    pt_rsrc,
+                    spec,
+                    spec_ok,
+                    col0,
+                    width,
+                    num_pages,
+                    wave,
+                    pre_s,
+                )
+                qf_h = _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early)
+                vals_h = _values(
+                    atom,
+                    ksrc,
+                    ks_rsrc,
+                    pt_rsrc,
+                    qf_h,
+                    safe_row,
+                    spec,
+                    spec_ok,
+                    col0,
+                    lane,
+                    n_in,
+                    kgrp,
+                    width,
+                    num_pages,
+                    vis_s,
+                    pre_s,
+                )
+                for j1 in range_constexpr(n_pairs):
+                    if out_cols[j1] < columns:
+                        _st_f32(logits_rsrc, out_offs[j1], vals_h[j1])
+            dead_h = (col0 >= vis_s) & (row < rows)
+            if dead_h:
+                for j2 in range_constexpr(n_pairs):
+                    if out_cols[j2] < columns:
+                        _st_f32(logits_rsrc, out_offs[j2], neg_inf)
+        if miss:
+            ctx_m = _ld_uniform_i32(cl_rsrc, safe_req * 4)
+            vis_m = req_ok.select(_imax(_imin(pos + 1, ctx_m), 0) // COMPRESS_RATIO, 0)
+            pre_m = _pre_ll(
+                pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, num_requests
+            )
+            if writer:
+                _st_i32(vis_rsrc, safe_row * 4, vis_m)
+                _st_i32(rst_rsrc, safe_row * 4, fx.Int32(0))
+            live_m = (col0 < vis_m) & (row < rows)
+            if live_m:
+                stage(
+                    KV,
+                    storage,
+                    pt_rsrc,
+                    safe_req,
+                    req_ok,
+                    col0,
+                    width,
+                    num_pages,
+                    wave,
+                    pre_m,
+                )
+                qf_m = _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early)
+                vals_m = _values(
+                    atom,
+                    ksrc,
+                    ks_rsrc,
+                    pt_rsrc,
+                    qf_m,
+                    safe_row,
+                    safe_req,
+                    req_ok,
+                    col0,
+                    lane,
+                    n_in,
+                    kgrp,
+                    width,
+                    num_pages,
+                    vis_m,
+                    pre_m,
+                )
+                for j3 in range_constexpr(n_pairs):
+                    if out_cols[j3] < columns:
+                        _st_f32(logits_rsrc, out_offs[j3], vals_m[j3])
+            dead_m = (col0 >= vis_m) & (row < rows)
+            if dead_m:
+                for j4 in range_constexpr(n_pairs):
+                    if out_cols[j4] < columns:
+                        _st_f32(logits_rsrc, out_offs[j4], neg_inf)
+
+    selected_kernel = kernel_spec if ll == 3 else kernel
+
     @flyc.jit
     def launch(
         Q,
@@ -6928,8 +7106,8 @@ def _build_draft_kernel(
         width,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        kernel._func.__name__ = kernel_name
-        kernel(
+        selected_kernel._func.__name__ = kernel_name
+        selected_kernel(
             Q,
             KV,
             KS,
@@ -7257,6 +7435,8 @@ def _build_decode_group_kernel(
     P = _check_page_size(page_size)
     group_rows, row_mode, waves = _check_decg_knobs(group_rows, row_mode, wg_waves)
     ll = _check_ll(ll)
+    if ll == 3:
+        raise ValueError("decode-group ll must be 0, 1 or 2 (ll=3 is draft-only)")
     threads = WMMA_WAVE * waves
     n_pass = group_rows
     if wave_cols not in (32, 64):

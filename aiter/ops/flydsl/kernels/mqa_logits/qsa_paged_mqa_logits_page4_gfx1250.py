@@ -6147,6 +6147,131 @@ if _DRAFT_WG_WAVES_SPEC not in ("auto", "4", "2", "1"):
 _DRAFT_WG_WAVES = None if _DRAFT_WG_WAVES_SPEC == "auto" else int(_DRAFT_WG_WAVES_SPEC)
 
 
+# ROUND-DEC20 (DEC20_LL): low-latency prologue builder keyword ``ll`` of the draft and
+# decode-group kernels (default 0 = the existing kernels, trace-identical, same names).
+# ll=1 reorders only WHEN the loads are issued, never what is computed or stored:
+#   * Q fragments (they depend on the row / group only) are issued first, before the
+#     token_to_request load, so their latency hides under the metadata chain;
+#   * the page-table lookups -- the SGPR row ids of the TDM gathers and the lanes' page
+#     ids (masks, fp8 scale addresses) -- are issued right after token_to_request,
+#     together with the context_lens / query_positions loads, instead of behind them
+#     and behind the visible-columns branch (decode-group: pass 0's request only;
+#     the mixed-group passes p > 0 keep their in-branch lookups).
+# Dependent memory round trips before the K gather: 3 -> 2 (t2r, page table); the Q
+# round trip of the bf16 draft (Q loaded after s_wait_tensorcnt) disappears. Dead
+# slabs (col0 >= visible) now also issue their page-table loads (clamped, in bounds;
+# no K gather): a few SGPR/VMEM dwords per wave. Kernel name suffix ``_ll``.
+#
+# The no-device ISA of the ll=0 kernels shows WHY the gather starts late: the TDM row ids
+# are one ``s_buffer_load_b32`` per page lookup, each followed by ``s_wait_kmcnt 0`` and
+# its SALU mask before the next is issued (P4 w32: 8 serialized scalar round trips per
+# wave; P8 4; P16 2). Both ll modes load a wave's consecutive page-table entries with ONE
+# wide load per <= 8 (scalar) / 4 (vector) entries and mask per entry (same row ids):
+#   ll=1  scalar ``s_buffer_load_b{64,128,256}`` (LLVM may sink it into the live branch:
+#         s_buffer_load is readnone; one round trip there instead of n);
+#   ll=2  vector ``buffer_load_b{64,128}`` (uniform address) + ``v_readfirstlane`` -- a
+#         memory read the machine sinker keeps in the prologue (issued with ctx / pos).
+LL_MODES = (0, 1, 2)
+
+
+def _check_ll(ll) -> int:
+    v = int(ll)
+    if v not in LL_MODES:
+        raise ValueError(f"ll must be one of {LL_MODES}")
+    return v
+
+
+def _ll_tag(ll: int) -> str:
+    return {0: "", 1: "_ll", 2: "_ll2"}[ll]
+
+
+def _readlane_i32(x, lane: int):
+    from flydsl._mlir.dialects import llvm
+
+    return fx.Int32(
+        llvm.call_intrinsic(
+            fx.Int32.ir_type,
+            "llvm.amdgcn.readlane.i32",
+            [fx.Int32(x).ir_value(), fx.Int32(lane).ir_value()],
+            [],
+            [],
+        )
+    )
+
+
+def _readfirstlane_i32(x):
+    from flydsl._mlir.dialects import llvm
+
+    return fx.Int32(
+        llvm.call_intrinsic(
+            fx.Int32.ir_type,
+            "llvm.amdgcn.readfirstlane.i32",
+            [fx.Int32(x).ir_value()],
+            [],
+            [],
+        )
+    )
+
+
+def _ld_uniform_vec_i32(rsrc, byte_off, n, vector=False):
+    """``n`` (2 / 4 / 8) consecutive wave-uniform dwords: ONE scalar buffer load
+    (``vector=False``) or one uniform vector buffer load + readfirstlane (n <= 4)."""
+    if vector:
+        v = _ld_vec(rsrc, byte_off, n, fx.Int32)
+        return [_readfirstlane_i32(fx.Int32(v[i])) for i in range(n)]
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm
+
+    bits = llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc)
+    v4 = llvm.bitcast(ir.VectorType.get([4], fx.Int32.ir_type), bits)
+    vec = Vec(
+        llvm.call_intrinsic(
+            ir.VectorType.get([n], fx.Int32.ir_type),
+            f"llvm.amdgcn.s.buffer.load.v{n}i32",
+            [v4, fx.Int32(byte_off).ir_value(), fx.Int32(0).ir_value()],
+            [],
+            [],
+        )
+    )
+    return [fx.Int32(vec[i]) for i in range(n)]
+
+
+def _wide_row_ids(
+    pt_rsrc, safe_req, req_ok, col0, width, num_pages, P, wave_cols, ll
+):
+    """TDM row ids of a wave's ``wave_cols // 8`` gather groups (the per-lookup math of
+    ``_stage_tdm`` / ``_p16_row_ids``) from wide page-table loads (ll 1 / 2)."""
+    n_groups = wave_cols // 8
+    if P == 4:
+        n_ent, first = 2 * n_groups, col0 // 4
+    elif P == 8:
+        n_ent, first = n_groups, col0 // 8
+    else:
+        n_ent, first = max(1, n_groups // 2), col0 // 16
+    vector = ll == 2
+    chunk = 4 if vector else 8
+    ents = []
+    for c0 in range(0, n_ent, chunk):
+        m = min(chunk, n_ent - c0)
+        ents += _ld_uniform_vec_i32(
+            pt_rsrc, (safe_req * width + first + c0) * 4, m, vector
+        )
+    phys = []
+    for i in range(n_ent):
+        logical_ok = (first + i) < width
+        valid = req_ok & logical_ok & (ents[i] >= 0) & (ents[i] < num_pages)
+        phys.append(valid.select(ents[i], 0))
+    out = []
+    for g in range(n_groups):
+        if P == 4:
+            out.append([phys[2 * g + pg] * 4 + r for pg in range(2) for r in range(4)])
+        elif P == 8:
+            out.append([phys[g] * 8 + r for r in range(8)])
+        else:
+            out.append([phys[g // 2] * 16 + ((g % 2) * 8 + r) for r in range(8)])
+    return out
+
+
 def draft_wg_waves(is_fp8: bool) -> int:
     """Effective draft workgroup waves of the dtype (QSA_DRAFT_WG_WAVES, 'auto' default)."""
     if _DRAFT_WG_WAVES is None:
@@ -6223,6 +6348,7 @@ def _build_draft_kernel(
     pos64: bool = False,
     page_size: int = PAGE_SIZE,
     wg_waves: int = DRAFT_WAVES,
+    ll: int = 0,
 ):
     """One-row-per-wave draft specialization (see the Round DRAFT block).
 
@@ -6230,10 +6356,15 @@ def _build_draft_kernel(
     shared ``_pos_loaders`` seam (SGPR variant); ``False`` is the DRAFT kernel.
     ROUND-R2 ``wg_waves`` 4 (default, trace-identical) | 2 | 1: wave column slabs
     per workgroup (short contexts / small batches: more, smaller workgroups).
+    ROUND-DEC20 ``ll`` 0 (default, trace-identical) | 1: low-latency prologue (see
+    ``DEC20_LL``): Q fragments issued first, page-table lookups (SGPR TDM row ids
+    and the lanes' page ids) issued as soon as the request id is known -- not
+    behind the context / position loads and the visible-columns branch.
     """
     _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
     P = _check_page_size(page_size)
     waves = int(wg_waves)
+    ll = _check_ll(ll)
     if waves not in _WG_WAVES:
         raise ValueError(f"draft wg_waves must be one of {_WG_WAVES}")
     threads = WMMA_WAVE * waves
@@ -6275,6 +6406,7 @@ def _build_draft_kernel(
         + (_CVT_ASM_TAG if is_fp8 else "")
         + sched_tag
         + (f"_wg{waves}" if waves != DRAFT_WAVES else "")
+        + _ll_tag(ll)
     )
 
     def _frag(rsrc, byte_off):
@@ -6286,6 +6418,45 @@ def _build_draft_kernel(
         t = fx.make_rmem_tensor(8, fx.Int32)
         t.store(vec)
         return t
+
+    # ---- ROUND-DEC20 low-latency prologue (ll=1 only; ll=0 emits nothing here) ----
+    def _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages):
+        """The SGPR row ids of every 8-row gather group (same math as _stage_tdm)."""
+        return _wide_row_ids(
+            pt_rsrc, safe_req, req_ok, col0, width, num_pages, P, wave_cols, ll
+        )
+
+    def _lane_pages(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
+        """[(phys, page_ok)] of the lane's column per N tile (same math as _tile_k)."""
+        out = []
+        for nt in range_constexpr(n_tiles):
+            c = col0 + nt * WMMA_N + n_in
+            logical = c // P
+            logical_ok = logical < width
+            safe_logical = logical_ok.select(logical, 0)
+            phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
+            page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+            out.append((page_ok.select(phys, 0), page_ok))
+        return out
+
+    def _pre_none(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
+        return None
+
+    def _pre_ll(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
+        rids = (
+            _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages)
+            if use_tdm
+            else None
+        )
+        return rids, _lane_pages(
+            pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages
+        )
+
+    def _q_early_none(q_rsrc, row, rows, n_in, kgrp):
+        return None
+
+    def _q_early_ll(q_rsrc, row, rows, n_in, kgrp):
+        return _q_frags(q_rsrc, _imin(row, rows - 1), n_in, kgrp)
 
     def _storage_tdm(kv_rsrc):
         return (
@@ -6299,11 +6470,13 @@ def _build_draft_kernel(
         return kv_rsrc
 
     def _stage_tdm(
-        KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave
+        KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave, pre=None
     ):
         # SGPR-only descriptors (wave_id, request, page table); wave-private tile.
         for group in range_constexpr(wave_cols // 8):
-            if P == 4:
+            if pre is not None:  # ROUND-DEC20 ll: row ids loaded in the prologue
+                row_ids = pre[0][group]
+            elif P == 4:
                 row_ids = []
                 for page in range_constexpr(2):
                     logical = col0 // 4 + group * 2 + page
@@ -6345,7 +6518,7 @@ def _build_draft_kernel(
         fx.rocdl.tdm_ops.tensor_wait(0)
 
     def _stage_raw(
-        KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave
+        KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave, pre=None
     ):
         pass
 
@@ -6436,6 +6609,10 @@ def _build_draft_kernel(
         cols = [col0 + j * WMMA_WAVE + lane for j in range_constexpr(n_pairs)]
         return cols, [_imin(safe_row * columns + c, last) * 4 for c in cols]
 
+    if ll and sched not in ("base", "qpre"):
+        raise ValueError(f"draft ll=1 supports the base / qpre schedules, not {sched!r}")
+    pre_fn = _pre_ll if ll else _pre_none
+    q_early_fn = _q_early_ll if ll else _q_early_none
     storage_fn = _storage_tdm if use_tdm else _storage_raw
     wave_src = _wave_src_tdm if use_tdm else _wave_src_raw
     stage = _stage_tdm if use_tdm else _stage_raw
@@ -6454,8 +6631,11 @@ def _build_draft_kernel(
             _frag(q_rsrc, base_q + s * kstep_q) for s in range_constexpr(WMMA_K_STEPS)
         ]
 
-    def _wait_and_q(q_rsrc, safe_row, n_in, kgrp):
+    def _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early=None):
         """K staging wait + Q fragments, in the schedule's order (plain Python)."""
+        if q_early is not None:  # ROUND-DEC20 ll: Q already in flight since the prologue
+            stage_wait()
+            return q_early
         if sched == "base":
             stage_wait()
             return _q_frags(q_rsrc, safe_row, n_in, kgrp)
@@ -6465,18 +6645,32 @@ def _build_draft_kernel(
         return qf
 
     def _tile_k(
-        ksrc, pt_rsrc, safe_req, req_ok, col0, n_in, kgrp, width, num_pages, nt
+        ksrc,
+        pt_rsrc,
+        safe_req,
+        req_ok,
+        col0,
+        n_in,
+        kgrp,
+        width,
+        num_pages,
+        nt,
+        pre_page=None,
     ):
         """Page lookup + the WMMA_K_STEPS (converted) K fragments of N tile ``nt``."""
         local = nt * WMMA_N + n_in
         c = col0 + local
-        logical = c // P
-        off = c % P
-        logical_ok = logical < width
-        safe_logical = logical_ok.select(logical, 0)
-        phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
-        page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-        phys = page_ok.select(phys, 0)
+        if pre_page is not None:  # ROUND-DEC20 ll: page id loaded in the prologue
+            off = c % P
+            phys, page_ok = pre_page
+        else:  # ll=0: the champion op order (trace-identical)
+            logical = c // P
+            off = c % P
+            logical_ok = logical < width
+            safe_logical = logical_ok.select(logical, 0)
+            phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
+            page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+            phys = page_ok.select(phys, 0)
         k_base = kbase(phys, off, local, kgrp)
         kf = [
             kfrag(ksrc, k_base + s * kstep_k, kgrp)
@@ -6507,6 +6701,7 @@ def _build_draft_kernel(
         width,
         num_pages,
         vis,
+        pre=None,
     ):
         """[value] per store pair j: column col0 + 32 j + lane (tile 2 j + kgrp)."""
         g0 = kgrp == 0
@@ -6525,6 +6720,7 @@ def _build_draft_kernel(
                     width,
                     num_pages,
                     nt,
+                    None if pre is None else pre[1][nt],
                 )
                 accs.append(_tile_mma(atom, qf, kf))
                 oks.append(page_ok.select(fx.Int32(1), fx.Int32(0)))
@@ -6629,11 +6825,15 @@ def _build_draft_kernel(
         logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
         vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
         rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        # ROUND-DEC20 ll: Q fragments first (they depend on the row only); ll=0: no ops.
+        q_early = q_early_fn(q_rsrc, row, rows, n_in, kgrp)
         # SGPR row metadata (grid.y == rows, still clamped for loads/stores).
         safe_row = _imin(row, rows - 1)
         req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
         req_ok = (req >= 0) & (req < num_requests)
         safe_req = req_ok.select(req, 0)
+        # ROUND-DEC20 ll: page-table lookups as soon as the request is known; ll=0: no ops.
+        pre = pre_fn(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages)
         ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
         pos = ld_uniform_pos(qp_rsrc, safe_row)
         vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
@@ -6650,8 +6850,10 @@ def _build_draft_kernel(
         neg_inf = fx.Float32(_NEG_INF)
         live = (col0 < vis) & (row < rows)
         if live:
-            stage(KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave)
-            qf = _wait_and_q(q_rsrc, safe_row, n_in, kgrp)
+            stage(
+                KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave, pre
+            )
+            qf = _wait_and_q(q_rsrc, safe_row, n_in, kgrp, q_early)
             vals = _values(
                 atom,
                 ksrc,
@@ -6668,6 +6870,7 @@ def _build_draft_kernel(
                 width,
                 num_pages,
                 vis,
+                pre,
             )
             for j1 in range_constexpr(n_pairs):
                 if out_cols[j1] < columns:
@@ -7013,6 +7216,7 @@ def _build_decode_group_kernel(
     group_rows: int = DECG_ROWS,
     row_mode: str = "base",
     wg_waves: int = DECG_WAVES,
+    ll: int = 0,
 ):
     """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
 
@@ -7020,11 +7224,13 @@ def _build_decode_group_kernel(
     ``group_rows`` 4 | 3 (rows per group; 3 = MTP verify with 3 rows per request,
     the WMMA M slots of lane row 3 are never stored), ``row_mode`` 'base' |
     'dedup' | 'pad' (see ``decode_group_passes_x``), ``wg_waves`` 4 | 2 | 1
-    (wave column slabs per workgroup).
+    (wave column slabs per workgroup). ROUND-DEC20 ``ll`` 0 (default,
+    trace-identical) | 1: low-latency prologue (``DEC20_LL`` block; pass 0 only).
     """
-    _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
+    ld_lane_pos, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
     P = _check_page_size(page_size)
     group_rows, row_mode, waves = _check_decg_knobs(group_rows, row_mode, wg_waves)
+    ll = _check_ll(ll)
     threads = WMMA_WAVE * waves
     n_pass = group_rows
     if wave_cols not in (32, 64):
@@ -7064,6 +7270,7 @@ def _build_decode_group_kernel(
         + (_CVT_ASM_TAG if is_fp8 else "")
         + sched_tag
         + _decg_knob_tag(group_rows, row_mode, waves)
+        + _ll_tag(ll)
     )
 
     def _i01(cond):
@@ -7087,18 +7294,44 @@ def _build_decode_group_kernel(
             .ptr
         )
 
-    def _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests):
+    def _meta_lanes(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, n, lane):
+        """ROUND-DEC20 ll=2: the group's n rows' (req, ctx, pos) with ONE per-lane vector
+        load each (lane i < n reads row min(t0 + i, rows - 1), the same clamped row as
+        the SGPR loop) + v_readlane into SGPRs: 2 dependent round trips (t2r -> ctx)
+        instead of the scalar loop's serialized per-row load / wait pairs."""
+        lrow = _imin(t0 + _imin(lane, n - 1), rows - 1)
+        req_l = _ld_i32(t2r_rsrc, lrow * 4)
+        pos_l = ld_lane_pos(qp_rsrc, lrow)
+        ok_l = (req_l >= 0) & (req_l < num_requests)
+        ctx_l = _ld_i32(cl_rsrc, ok_l.select(req_l, 0) * 4)
+        return [
+            (_readlane_i32(req_l, i), _readlane_i32(ctx_l, i), _readlane_i32(pos_l, i))
+            for i in range(n)
+        ]
+
+    def _meta_lanes_none(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, n, lane):
+        return None
+
+    meta_lanes_fn = _meta_lanes if ll == 2 else _meta_lanes_none
+
+    def _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, vm=None):
         """SGPR metadata of the group's 4 rows (clamped loads)."""
         out = []
         for i in range_constexpr(DECG_ROWS):
             row = t0 + i
             row_ok = row < rows
             safe_row = _imin(row, rows - 1)
-            req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
-            req_ok = (req >= 0) & (req < num_requests)
-            safe_req = req_ok.select(req, 0)
-            ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
-            pos = ld_uniform_pos(qp_rsrc, safe_row)
+            if vm is not None:  # ROUND-DEC20 ll=2: lane-parallel loads
+                req = vm[i][0]
+                req_ok = (req >= 0) & (req < num_requests)
+                safe_req = req_ok.select(req, 0)
+                ctx, pos = vm[i][1], vm[i][2]
+            else:
+                req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
+                req_ok = (req >= 0) & (req < num_requests)
+                safe_req = req_ok.select(req, 0)
+                ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
+                pos = ld_uniform_pos(qp_rsrc, safe_row)
             vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
             out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
         return out
@@ -7155,7 +7388,7 @@ def _build_decode_group_kernel(
         return v
 
     # ---- ROUND-R2 row modes (group_rows 3 or row_mode != 'base' only) --------
-    def _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests):
+    def _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, vm=None):
         """SGPR metadata of the group's ``group_rows`` rows + ``real`` (stored rows).
 
         real = row < min(rows, t0 + group_rows) [& valid request in 'pad' mode:
@@ -7167,11 +7400,17 @@ def _build_decode_group_kernel(
             row = t0 + i
             row_ok = row < lim
             safe_row = _imin(row, rows - 1)
-            req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
-            req_ok = (req >= 0) & (req < num_requests)
-            safe_req = req_ok.select(req, 0)
-            ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
-            pos = ld_uniform_pos(qp_rsrc, safe_row)
+            if vm is not None:  # ROUND-DEC20 ll=2: lane-parallel loads
+                req = vm[i][0]
+                req_ok = (req >= 0) & (req < num_requests)
+                safe_req = req_ok.select(req, 0)
+                ctx, pos = vm[i][1], vm[i][2]
+            else:
+                req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
+                req_ok = (req >= 0) & (req < num_requests)
+                safe_req = req_ok.select(req, 0)
+                ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
+                pos = ld_uniform_pos(qp_rsrc, safe_row)
             vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
             m = _RowMeta(row, row_ok, req, req_ok, safe_req, vis)
             m.real = (row_ok & req_ok) if row_mode == "pad" else row_ok
@@ -7242,7 +7481,10 @@ def _build_decode_group_kernel(
         t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
     ):
         """536667d5 kernel prologue, same op order: (plans, my_vis, meta_off, writer)."""
-        meta = _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        vm = meta_lanes_fn(
+            t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, DECG_ROWS, lane
+        )
+        meta = _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, vm)
         plans = _group_plans(meta, kgrp)
         my_vis = _pick_vis(lane, meta)
         my_row = t0 + _imin(lane, DECG_ROWS - 1)
@@ -7254,7 +7496,10 @@ def _build_decode_group_kernel(
         t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
     ):
         """ROUND-R2 dedup / pad / 3-row prologue."""
-        meta = _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        vm = meta_lanes_fn(
+            t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, group_rows, lane
+        )
+        meta = _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, vm)
         plans = _group_plans_x(meta, kgrp)
         my_vis = _pick_vis_x(lane, meta)
         my_row = t0 + _imin(lane, group_rows - 1)
@@ -7282,10 +7527,12 @@ def _build_decode_group_kernel(
             _frag(q_rsrc, base + s * kstep_q) for s in range_constexpr(WMMA_K_STEPS)
         ]
 
-    def _issue(KV, storage, pt_rsrc, pp, col0, width, num_pages, wave):
+    def _issue(KV, storage, pt_rsrc, pp, col0, width, num_pages, wave, pre=None):
         # SGPR-only descriptors (wave_id, pass request, page table); wave-private tile.
         for group in range_constexpr(wave_cols // 8):
-            if P == 4:
+            if pre is not None:  # ROUND-DEC20 ll: row ids loaded in the prologue
+                row_ids = pre[0][group]
+            elif P == 4:
                 row_ids = []
                 for page in range_constexpr(2):
                     logical = col0 // 4 + group * 2 + page
@@ -7327,6 +7574,51 @@ def _build_decode_group_kernel(
                 wave * tile_bytes + group * 8 * pitch,
                 P,
             )
+
+    # ---- ROUND-DEC20 low-latency prologue (ll=1 only; ll=0 emits nothing) ----------
+    def _rowids_pass(pt_rsrc, pp, col0, width, num_pages):
+        """SGPR row ids of every 8-row gather group of a pass (same math as _issue)."""
+        return _wide_row_ids(
+            pt_rsrc, pp.safe_req, pp.req_ok, col0, width, num_pages, P, wave_cols, ll
+        )
+
+    def _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages):
+        """[(phys, page_ok)] of the lane's column per N tile (same math as _tile_k)."""
+        out = []
+        for nt in range_constexpr(n_tiles):
+            logical = cols[nt] // P
+            logical_ok = logical < width
+            safe_logical = logical_ok.select(logical, 0)
+            phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
+            page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+            out.append((page_ok.select(phys, 0), page_ok))
+        return out
+
+    def _pres_none(pt_rsrc, plans, col0, n_in, width, num_pages):
+        return [None] * n_pass
+
+    def _pres_ll(pt_rsrc, plans, col0, n_in, width, num_pages):
+        pp = plans[0]
+        cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
+        pre0 = (
+            _rowids_pass(pt_rsrc, pp, col0, width, num_pages),
+            _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages),
+        )
+        return [pre0] + [None] * (n_pass - 1)
+
+    def _q_early_none(q_rsrc, t0, rows, n_in, kgrp):
+        return None
+
+    def _q_early_ll(q_rsrc, t0, rows, n_in, kgrp):
+        return _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+
+    def _q_pass(q_rsrc, t0, rows, n_in, kgrp, q_early):
+        if q_early is not None:  # ll: Q fragments in flight since the prologue
+            return q_early
+        return _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+
+    pres_fn = _pres_ll if ll else _pres_none
+    q_early_fn = _q_early_ll if ll else _q_early_none
 
     def _tensor_done():
         # Same-wave consumer: data is in LDS once TENSORcnt reaches 0.
@@ -7425,6 +7717,7 @@ def _build_decode_group_kernel(
         columns,
         width,
         num_pages,
+        pre=None,
     ):
         """[(store_ok, byte_off, value)]: rows a/b of every tile column (r16 order)."""
         neg_inf = fx.Float32(_NEG_INF)
@@ -7432,13 +7725,17 @@ def _build_decode_group_kernel(
         def _tile_k(nt):
             c = cols[nt]
             local = nt * WMMA_N + n_in
-            logical = c // P
-            off = c % P
-            logical_ok = logical < width
-            safe_logical = logical_ok.select(logical, 0)
-            phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
-            page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-            phys = page_ok.select(phys, 0)
+            if pre is not None:  # ROUND-DEC20 ll: page id loaded in the prologue
+                off = c % P
+                phys, page_ok = pre[1][nt]
+            else:  # ll=0: the 536667d5 op order (trace-identical)
+                logical = c // P
+                off = c % P
+                logical_ok = logical < width
+                safe_logical = logical_ok.select(logical, 0)
+                phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
+                page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                phys = page_ok.select(phys, 0)
             k_base = local * pitch + pp.kgrp * kgrp_bytes
             kf = [
                 kfrag(ksrc, k_base + s * kstep_k, pp.kgrp)
@@ -7527,11 +7824,16 @@ def _build_decode_group_kernel(
         logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
         vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
         rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        # ROUND-DEC20 ll: Q fragments first (group rows only); ll=0: no ops.
+        q_early = q_early_fn(q_rsrc, t0, rows, n_in, kgrp)
         # Trace-time row-mode selection lives outside the kernel AST (an `if` here
         # would be lowered as a runtime branch); 'base' = the 536667d5 sequence.
         plans, my_vis, meta_off, writer = group_head(
             t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
         )
+        # ROUND-DEC20 ll: pass 0's page-table lookups right after the metadata loads
+        # are issued (ll=0: [None] * passes, no ops).
+        pres = pres_fn(pt_rsrc, plans, col0, n_in, width, num_pages)
         if writer:
             _st_i32(vis_rsrc, meta_off, my_vis)
             _st_i32(rst_rsrc, meta_off, fx.Int32(0))
@@ -7547,8 +7849,10 @@ def _build_decode_group_kernel(
             pp = plans[p]
             if pp.active:
                 if col0 < pp.vmax:
-                    _issue(KV, storage, pt_rsrc, pp, col0, width, num_pages, wave)
-                    qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+                    _issue(
+                        KV, storage, pt_rsrc, pp, col0, width, num_pages, wave, pres[p]
+                    )
+                    qf = _q_pass(q_rsrc, t0, rows, n_in, kgrp, q_early)
                     _tensor_done()
                     res = _pass_values(
                         atom,
@@ -7564,6 +7868,7 @@ def _build_decode_group_kernel(
                         columns,
                         width,
                         num_pages,
+                        pres[p],
                     )
                     for j1 in range_constexpr(len(res)):
                         if res[j1][0]:

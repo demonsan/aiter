@@ -313,10 +313,19 @@ def _knob_kw(vid: str, params) -> dict:
         return {}
     kind = P.variant_kind(vid)
     w = int(knobs.get("wg_waves", P.KNOB_DEFAULTS["wg_waves"]))
+    # ROUND-DEC20: low-latency prologue (keyword only when pinned on: ll=0 keeps the
+    # exact pre-DEC20 builder keywords / lru entries)
+    llv = int(knobs.get("ll", P.KNOB_DEFAULTS["ll"]))
+    ll = {"ll": llv} if llv else {}
     if kind == "draft":
-        return {"wg_waves": w}
+        return {"wg_waves": w, **ll}
     g = int(knobs.get("group_rows", P.KNOB_DEFAULTS["group_rows"]))
-    return {"group_rows": g, "row_mode": "dedup" if g == 3 else "base", "wg_waves": w}
+    return {
+        "group_rows": g,
+        "row_mode": "dedup" if g == 3 else "base",
+        "wg_waves": w,
+        **ll,
+    }
 
 
 def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
@@ -326,6 +335,8 @@ def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
         return False
     rb, rk = P.split_knobs(vid, params)
     wb, wk = P.split_knobs(want_vid, want_params)
+    # ROUND-DEC20: ``ll`` is never applied by the environment (entry-pinned only)
+    wk = {k: v for k, v in wk.items() if k != "ll"}
     return rb == wb and (not rk or rk == wk)
 
 

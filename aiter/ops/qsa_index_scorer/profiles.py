@@ -338,11 +338,14 @@ def page_of(entry: Mapping[str, Any]) -> int:
 #: pinned specialization. ``group_rows`` 3 (kernel-native MTP-verify 3-row groups)
 #: is bucket-only (rows == 3*requests); ``row_mode`` is never pinned by a profile
 #: ('pad' changes invalid token_to_request semantics: op-internal padded calls only).
+#: ROUND-DEC20: ``ll`` 1 / 2 = the low-latency-prologue specializations of the draft /
+#: decode-group kernels (builder keyword ``ll``; kernel ``DEC20_LL`` block); 0 (absent)
+#: = the existing kernels.
 LAUNCH_KNOBS: dict[str, dict[str, tuple]] = {
-    "draft": {"wg_waves": (4, 2, 1)},
-    "decg": {"wg_waves": (4, 2, 1), "group_rows": (4, 3)},
+    "draft": {"wg_waves": (4, 2, 1), "ll": (0, 1, 2)},
+    "decg": {"wg_waves": (4, 2, 1), "group_rows": (4, 3), "ll": (0, 1, 2)},
 }
-KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4}
+KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0}
 
 
 def variant_kind(vid: str) -> str:

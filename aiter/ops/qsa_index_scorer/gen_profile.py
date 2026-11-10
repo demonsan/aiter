@@ -87,8 +87,8 @@ R3_KERNEL_SHA256 = "6b537f3bc8caa54d7b6dfd66a5ff7ca396d0647c189febeadf4d48c1f9f5
 #: ROUND-DEC20: opt-in ``ll`` (1 / 2) low-latency prologue of the draft / decode-group
 #: builders (new kernel names ``_ll`` / ``_ll2``); every page-4/8/16 bf16+fp8 default and
 #: routable specialization byte-identical to R3 6b537f3b (no-device gate base 6b537f3b:
-#: records/dec20/isa-evidence.json).
-KERNEL_SHA256 = "61b1c77eef0fe6fc692b6047a9593afae7c9864440ae36e6166f788735f4da2d"
+#: records/dec20/v2/isa-evidence.json; the wide page-table loads are clamped in bounds).
+KERNEL_SHA256 = "25f2462d113f0c7c5d2e4ef8ba5f41d9f307592e44e3e58ab801c2da874f22e7"
 #: The ISA-identity chain page-4 evidence travels along (each link one no-device gate:
 #: records/page16, records/r2-kernel, records/r2c, records/r2d, records/r2e,
 #: records/integration/lint-isa, records/integration/r3-aiter/decg-key isa-evidence.json).

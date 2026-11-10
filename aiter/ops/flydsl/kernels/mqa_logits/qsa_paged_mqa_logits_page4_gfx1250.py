@@ -6237,10 +6237,18 @@ def _ld_uniform_vec_i32(rsrc, byte_off, n, vector=False):
 
 
 def _wide_row_ids(
-    pt_rsrc, safe_req, req_ok, col0, width, num_pages, P, wave_cols, ll
+    pt_rsrc, safe_req, req_ok, col0, width, num_pages, P, wave_cols, ll, num_requests
 ):
     """TDM row ids of a wave's ``wave_cols // 8`` gather groups (the per-lookup math of
-    ``_stage_tdm`` / ``_p16_row_ids``) from wide page-table loads (ll 1 / 2)."""
+    ``_stage_tdm`` / ``_p16_row_ids``) from wide page-table loads (ll 1 / 2).
+
+    In-bounds by construction (gfx1250 V# has no OOB check, see the access-layer note):
+    each wide load of ``m`` entries starts at ``base = min(want, max(total - m, 0))``
+    (``total`` = requests x width entries) and entry ``i`` is taken from lane ``i + d``
+    (``d = want - base``); entries the shift pushes out of the vector are beyond the
+    request's row (``logical >= width``) and masked like the ll=0 path masks them. Only a
+    table with fewer than ``m`` (<= 8) entries in total is read past its end (by < 32 B).
+    """
     n_groups = wave_cols // 8
     if P == 4:
         n_ent, first = 2 * n_groups, col0 // 4
@@ -6250,12 +6258,19 @@ def _wide_row_ids(
         n_ent, first = max(1, n_groups // 2), col0 // 16
     vector = ll == 2
     chunk = 4 if vector else 8
+    total = _imax(num_requests, 1) * width
     ents = []
     for c0 in range(0, n_ent, chunk):
         m = min(chunk, n_ent - c0)
-        ents += _ld_uniform_vec_i32(
-            pt_rsrc, (safe_req * width + first + c0) * 4, m, vector
-        )
+        want = safe_req * width + (first + c0)
+        base = _imin(want, _imax(total - m, 0))
+        d = want - base
+        vec = _ld_uniform_vec_i32(pt_rsrc, base * 4, m, vector)
+        for i in range(m):
+            v = fx.Int32(0)
+            for j in range(m - 1 - i, -1, -1):
+                v = (d == j).select(vec[i + j], v)
+            ents.append(v)
     phys = []
     for i in range(n_ent):
         logical_ok = (first + i) < width
@@ -6420,10 +6435,19 @@ def _build_draft_kernel(
         return t
 
     # ---- ROUND-DEC20 low-latency prologue (ll=1 only; ll=0 emits nothing here) ----
-    def _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages):
+    def _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages, num_requests):
         """The SGPR row ids of every 8-row gather group (same math as _stage_tdm)."""
         return _wide_row_ids(
-            pt_rsrc, safe_req, req_ok, col0, width, num_pages, P, wave_cols, ll
+            pt_rsrc,
+            safe_req,
+            req_ok,
+            col0,
+            width,
+            num_pages,
+            P,
+            wave_cols,
+            ll,
+            num_requests,
         )
 
     def _lane_pages(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
@@ -6439,12 +6463,12 @@ def _build_draft_kernel(
             out.append((page_ok.select(phys, 0), page_ok))
         return out
 
-    def _pre_none(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
+    def _pre_none(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, nreq):
         return None
 
-    def _pre_ll(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages):
+    def _pre_ll(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, nreq):
         rids = (
-            _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages)
+            _rowids_tdm(pt_rsrc, safe_req, req_ok, col0, width, num_pages, nreq)
             if use_tdm
             else None
         )
@@ -6833,7 +6857,9 @@ def _build_draft_kernel(
         req_ok = (req >= 0) & (req < num_requests)
         safe_req = req_ok.select(req, 0)
         # ROUND-DEC20 ll: page-table lookups as soon as the request is known; ll=0: no ops.
-        pre = pre_fn(pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages)
+        pre = pre_fn(
+            pt_rsrc, safe_req, req_ok, col0, n_in, width, num_pages, num_requests
+        )
         ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
         pos = ld_uniform_pos(qp_rsrc, safe_row)
         vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
@@ -7576,10 +7602,19 @@ def _build_decode_group_kernel(
             )
 
     # ---- ROUND-DEC20 low-latency prologue (ll=1 only; ll=0 emits nothing) ----------
-    def _rowids_pass(pt_rsrc, pp, col0, width, num_pages):
+    def _rowids_pass(pt_rsrc, pp, col0, width, num_pages, num_requests):
         """SGPR row ids of every 8-row gather group of a pass (same math as _issue)."""
         return _wide_row_ids(
-            pt_rsrc, pp.safe_req, pp.req_ok, col0, width, num_pages, P, wave_cols, ll
+            pt_rsrc,
+            pp.safe_req,
+            pp.req_ok,
+            col0,
+            width,
+            num_pages,
+            P,
+            wave_cols,
+            ll,
+            num_requests,
         )
 
     def _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages):
@@ -7594,14 +7629,14 @@ def _build_decode_group_kernel(
             out.append((page_ok.select(phys, 0), page_ok))
         return out
 
-    def _pres_none(pt_rsrc, plans, col0, n_in, width, num_pages):
+    def _pres_none(pt_rsrc, plans, col0, n_in, width, num_pages, nreq):
         return [None] * n_pass
 
-    def _pres_ll(pt_rsrc, plans, col0, n_in, width, num_pages):
+    def _pres_ll(pt_rsrc, plans, col0, n_in, width, num_pages, nreq):
         pp = plans[0]
         cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
         pre0 = (
-            _rowids_pass(pt_rsrc, pp, col0, width, num_pages),
+            _rowids_pass(pt_rsrc, pp, col0, width, num_pages, nreq),
             _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages),
         )
         return [pre0] + [None] * (n_pass - 1)
@@ -7833,7 +7868,7 @@ def _build_decode_group_kernel(
         )
         # ROUND-DEC20 ll: pass 0's page-table lookups right after the metadata loads
         # are issued (ll=0: [None] * passes, no ops).
-        pres = pres_fn(pt_rsrc, plans, col0, n_in, width, num_pages)
+        pres = pres_fn(pt_rsrc, plans, col0, n_in, width, num_pages, num_requests)
         if writer:
             _st_i32(vis_rsrc, meta_off, my_vis)
             _st_i32(rst_rsrc, meta_off, fx.Int32(0))

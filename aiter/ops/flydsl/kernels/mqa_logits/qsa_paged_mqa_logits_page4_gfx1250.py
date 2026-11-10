@@ -7351,17 +7351,28 @@ def decode_group_route(
     return _DECODE_GROUP_COLS
 
 
+#: ROUND-DEC20 multi-slab decode group (builder keyword ``slabs``, default 1 = unchanged):
+#: each wave scores ``slabs`` column slabs of its group (one span apart); Q fragments and
+#: the group metadata are loaded once; the K gather of slab s+1 is issued into the other
+#: half of a double-buffered wave-private LDS tile before slab s is computed
+#: (``s_wait_tensorcnt`` = the gathers of slab s+1 still in flight). grid.x shrinks by
+#: ``slabs``, LDS per wave doubles. Kernel name suffix ``_ms<slabs>``.
+DECG_SLABS = (1, 2, 4)
+
+
 def decode_group_grid(
     rows: int,
     columns: int,
     wave_cols: int,
     group_rows: int = DECG_ROWS,
     wg_waves: int = DECG_WAVES,
+    slabs: int = 1,
 ) -> tuple[int, int]:
-    """grid.x = column spans of ``wg_waves`` slabs, grid.y = ``group_rows``-row groups."""
+    """grid.x = column spans of ``wg_waves`` slabs (x ``slabs`` per wave, ROUND-DEC20),
+    grid.y = ``group_rows``-row groups."""
     if wave_cols not in (32, 64):
         raise ValueError("decode-group wave_cols must be 32 or 64")
-    span = int(wg_waves) * wave_cols
+    span = int(wg_waves) * wave_cols * int(slabs)
     g = int(group_rows)
     return (int(columns) + span - 1) // span, (int(rows) + g - 1) // g
 
@@ -7421,6 +7432,7 @@ def _build_decode_group_kernel(
     row_mode: str = "base",
     wg_waves: int = DECG_WAVES,
     ll: int = 0,
+    slabs: int = 1,
 ):
     """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
 
@@ -7437,6 +7449,13 @@ def _build_decode_group_kernel(
     ll = _check_ll(ll)
     if ll == 3:
         raise ValueError("decode-group ll must be 0, 1 or 2 (ll=3 is draft-only)")
+    slabs = int(slabs)
+    if slabs not in DECG_SLABS:
+        raise ValueError(f"decode-group slabs must be one of {DECG_SLABS}")
+    if slabs > 1 and wave_cols != 32:
+        # no-device builds: fp8 w64 x 2 slabs needs 241-252 VGPRs, x 4 slabs 265-290
+        # (> 256: VGPR-MSB addressing, WMMA hazards in the scan) -> 32-column slabs only
+        raise ValueError("decode-group slabs > 1 requires wave_cols 32")
     threads = WMMA_WAVE * waves
     n_pass = group_rows
     if wave_cols not in (32, 64):
@@ -7477,6 +7496,7 @@ def _build_decode_group_kernel(
         + sched_tag
         + _decg_knob_tag(group_rows, row_mode, waves)
         + _ll_tag(ll)
+        + (f"_ms{slabs}" if slabs != 1 else "")
     )
 
     def _i01(cond):
@@ -8095,6 +8115,173 @@ def _build_decode_group_kernel(
                         if msk[j2][0]:
                             _st_f32(logits_rsrc, msk[j2][1], neg_inf)
 
+    # ---- ROUND-DEC20 multi-slab body (slabs > 1 only; trace-time helpers) ------------
+    n_ops = wave_cols // 8  # TDM gather instructions per slab
+
+    def _storage_ms():
+        return (
+            fx.SharedAllocator(base_alignment=128, static=True)
+            .allocate(fx.Array[fx.Int32, 2 * waves * tile_bytes // 4, 128])
+            .peek()
+            .ptr
+        )
+
+    def _slab_cols(bx, wave):
+        """col0 of each slab and of the next slab (INT32_MAX after the last)."""
+        c0s = [
+            bx * (span * slabs) + s * span + wave * wave_cols
+            for s in range_constexpr(slabs)
+        ]
+        c0n = [c0s[s + 1] for s in range_constexpr(slabs - 1)] + [fx.Int32(2**31 - 1)]
+        return c0s, c0n
+
+    def _slab_lists(c0s, t0, kgrp, n_in, rows, columns):
+        colss, offss = [], []
+        for s in range_constexpr(slabs):
+            cols = [c0s[s] + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
+            colss.append(cols)
+            offss.append(_store_offsets(t0, kgrp, cols, rows, columns))
+        return colss, offss
+
+    def _slab_pres(pt_rsrc, plans, c0s, n_in, width, num_pages, nreq):
+        return [
+            pres_fn(pt_rsrc, plans, c0s[s], n_in, width, num_pages, nreq)
+            for s in range_constexpr(slabs)
+        ]
+
+    def _issue_next(KV, storage, pt_rsrc, pp, s, c0s, width, num_pages, wave, presl, p):
+        """Gather slab s+1 into the other buffer, then wait for slab s's gathers."""
+        if s + 1 < slabs:
+            _issue(
+                KV,
+                storage,
+                pt_rsrc,
+                pp,
+                c0s[s + 1],
+                width,
+                num_pages,
+                wave * 2 + (s + 1) % 2,
+                presl[s + 1][p],
+            )
+            fx.rocdl.tdm_ops.tensor_wait(n_ops)
+        else:
+            fx.rocdl.tdm_ops.tensor_wait(0)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
+    def kernel_ms(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bx = fx.Int32(fx.block_idx.x)
+        grp = fx.Int32(fx.block_idx.y)
+        wave = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        t0 = grp * group_rows
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        _kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)  # once for every slab and pass
+        plans, my_vis, meta_off, writer = group_head(
+            t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
+        )
+        c0s, c0n = _slab_cols(bx, wave)
+        presl = _slab_pres(pt_rsrc, plans, c0s, n_in, width, num_pages, num_requests)
+        if writer:
+            _st_i32(vis_rsrc, meta_off, my_vis)
+            _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
+        )
+        colss, offss = _slab_lists(c0s, t0, kgrp, n_in, rows, columns)
+        neg_inf = fx.Float32(_NEG_INF)
+        storage = _storage_ms()
+        ksrcs = [
+            storage + (wave * 2 + b) * (tile_bytes // 4) for b in range_constexpr(2)
+        ]
+        for p in range_constexpr(n_pass):
+            pp = plans[p]
+            if pp.active:
+                if c0s[0] < pp.vmax:
+                    _issue(
+                        KV,
+                        storage,
+                        pt_rsrc,
+                        pp,
+                        c0s[0],
+                        width,
+                        num_pages,
+                        wave * 2,
+                        presl[0][p],
+                    )
+                for s in range_constexpr(slabs):
+                    if c0n[s] < pp.vmax:
+                        _issue_next(
+                            KV,
+                            storage,
+                            pt_rsrc,
+                            pp,
+                            s,
+                            c0s,
+                            width,
+                            num_pages,
+                            wave,
+                            presl,
+                            p,
+                        )
+                    if c0n[s] >= pp.vmax:
+                        _tensor_done()
+                    if c0s[s] < pp.vmax:
+                        res = _pass_values(
+                            atom,
+                            ksrcs[s % 2],
+                            ks_rsrc,
+                            pt_rsrc,
+                            qf,
+                            pp,
+                            c0s[s],
+                            colss[s],
+                            offss[s],
+                            n_in,
+                            columns,
+                            width,
+                            num_pages,
+                            presl[s][p],
+                        )
+                        for j1 in range_constexpr(len(res)):
+                            if res[j1][0]:
+                                _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                        _war_guard()
+                    if c0s[s] >= pp.vmax:
+                        msk = _pass_masks(pp, colss[s], offss[s], columns)
+                        for j2 in range_constexpr(len(msk)):
+                            if msk[j2][0]:
+                                _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+
+    selected_kernel = kernel_ms if slabs > 1 else kernel
+
     @flyc.jit
     def launch(
         Q,
@@ -8116,8 +8303,8 @@ def _build_decode_group_kernel(
         width,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        kernel._func.__name__ = kernel_name
-        kernel(
+        selected_kernel._func.__name__ = kernel_name
+        selected_kernel(
             Q,
             KV,
             KS,
@@ -8146,6 +8333,8 @@ def _build_decode_group_kernel(
     launch.group_rows = group_rows
     launch.row_mode = row_mode
     launch.wg_waves = waves
+    launch.slabs = slabs
+    launch.cols_per_block = span * slabs
     return launch
 
 

@@ -320,11 +320,13 @@ def _knob_kw(vid: str, params) -> dict:
     if kind == "draft":
         return {"wg_waves": w, **ll}
     g = int(knobs.get("group_rows", P.KNOB_DEFAULTS["group_rows"]))
+    sl = int(knobs.get("slabs", P.KNOB_DEFAULTS["slabs"]))
     return {
         "group_rows": g,
         "row_mode": "dedup" if g == 3 else "base",
         "wg_waves": w,
         **ll,
+        **({"slabs": sl} if sl != 1 else {}),
     }
 
 
@@ -335,8 +337,8 @@ def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
         return False
     rb, rk = P.split_knobs(vid, params)
     wb, wk = P.split_knobs(want_vid, want_params)
-    # ROUND-DEC20: ``ll`` is never applied by the environment (entry-pinned only)
-    wk = {k: v for k, v in wk.items() if k != "ll"}
+    # ROUND-DEC20: ``ll`` / ``slabs`` are never applied by the environment (entry-pinned)
+    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs")}
     return rb == wb and (not rk or rk == wk)
 
 
@@ -1355,6 +1357,10 @@ class _Plan:
                 return K.draft_grid(rows, columns, a[3], kw["wg_waves"])
             return K.draft_grid(rows, columns, a[3])
         if self.kind == "decg":
+            if "slabs" in kw:  # ROUND-DEC20 multi-slab waves
+                return K.decode_group_grid(
+                    rows, columns, a[2], kw["group_rows"], kw["wg_waves"], kw["slabs"]
+                )
             if "group_rows" in kw:
                 return K.decode_group_grid(
                     rows, columns, a[2], kw["group_rows"], kw["wg_waves"]

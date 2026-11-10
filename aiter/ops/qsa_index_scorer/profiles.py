@@ -340,12 +340,18 @@ def page_of(entry: Mapping[str, Any]) -> int:
 #: ('pad' changes invalid token_to_request semantics: op-internal padded calls only).
 #: ROUND-DEC20: ``ll`` 1 / 2 (/ 3: draft only, speculative request id) = the
 #: low-latency-prologue specializations of the draft / decode-group kernels (builder keyword ``ll``; kernel ``DEC20_LL`` block); 0 (absent)
-#: = the existing kernels.
+#: = the existing kernels. ``slabs`` 2 / 4 (decode group only) = multi-slab waves with a
+#: double-buffered K gather (kernel ``DECG_SLABS``); 1 (absent) = the existing kernels.
 LAUNCH_KNOBS: dict[str, dict[str, tuple]] = {
     "draft": {"wg_waves": (4, 2, 1), "ll": (0, 1, 2, 3)},
-    "decg": {"wg_waves": (4, 2, 1), "group_rows": (4, 3), "ll": (0, 1, 2)},
+    "decg": {
+        "wg_waves": (4, 2, 1),
+        "group_rows": (4, 3),
+        "ll": (0, 1, 2),
+        "slabs": (1, 2, 4),
+    },
 }
-KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0}
+KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1}
 
 
 def variant_kind(vid: str) -> str:

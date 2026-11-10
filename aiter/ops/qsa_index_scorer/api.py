@@ -327,7 +327,7 @@ def _knob_kw(vid: str, params) -> dict:
     sl = int(knobs.get("slabs", P.KNOB_DEFAULTS["slabs"]))
     # ROUND-DEC20C: lane-vector row ids / speculative gather / split wait (only when pinned on)
     sgw = {
-        k: int(knobs[k]) for k in ("sg", "sw") if int(knobs.get(k, P.KNOB_DEFAULTS[k]))
+        k: int(knobs[k]) for k in ("sg", "sw", "kd") if int(knobs.get(k, P.KNOB_DEFAULTS[k]))
     }
     return {
         "group_rows": g,
@@ -347,7 +347,7 @@ def _route_ok(vid: str, params, want_vid: str, want_params) -> bool:
     rb, rk = P.split_knobs(vid, params)
     wb, wk = P.split_knobs(want_vid, want_params)
     # ROUND-DEC20: ``ll`` / ``slabs`` are never applied by the environment (entry-pinned)
-    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs", "fk", "sg", "sw")}  # + DEC20B/C
+    wk = {k: v for k, v in wk.items() if k not in ("ll", "slabs", "fk", "sg", "sw", "kd")}  # + DEC20B/C/D
     return rb == wb and (not rk or rk == wk)
 
 

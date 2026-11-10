@@ -355,12 +355,17 @@ LAUNCH_KNOBS: dict[str, dict[str, tuple]] = {
         "fk": (0, 1),
         "sg": (0, 1, 2),
         "sw": (0, 1),
+        "kd": (0, 1, 2),
     },
 }
 #: ROUND-DEC20C: decode-group ``sg`` 1 / 2 (ll=3 body with lane-vector TDM row ids; 2 = +
 #: speculative slab-0 gather; with sg the ll=3 body also takes slabs 2 / 4) and ``sw`` 1 (split
 #: tensor wait per WMMA tile; needs sg); 0 (absent) = the existing kernels (kernel DEC20C_SG).
-KNOB_DEFAULTS = {"wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1, "fk": 0, "sg": 0, "sw": 0}
+#: ROUND-DEC20D: decode-group ``kd`` 1 / 2 (K fragments loaded by the WMMA lanes straight from the
+#: K cache, no TDM / LDS; 2 = ll=3 speculative K loads before the hit check); 0 = existing kernels.
+KNOB_DEFAULTS = {
+    "wg_waves": 4, "group_rows": 4, "ll": 0, "slabs": 1, "fk": 0, "sg": 0, "sw": 0, "kd": 0
+}
 
 
 def variant_kind(vid: str) -> str:

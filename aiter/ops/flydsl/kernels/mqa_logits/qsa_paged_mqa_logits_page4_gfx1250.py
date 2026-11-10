@@ -6271,6 +6271,64 @@ def _sg_tag(sg: int, sw: int) -> str:
     return (f"_sg{sg}" if sg else "") + ("_sw" if sw else "")
 
 
+# ROUND-DEC20D (DEC20D_KD): decode-group builder keyword ``kd`` ("K direct"; default 0 = the
+# existing kernels, same names, same IR). The K fragments of every WMMA lane are loaded straight
+# from the K cache plane into VGPRs with lane buffer loads at row ``phys * P + c % P`` (the lane
+# page ids the ll >= 2 prologue already has), instead of TDM gather -> LDS -> ds_load. Round-3
+# GPU data + kernel-wiki ``mi400-reference-rates`` (TDM row: one producer wave sustains ~one TDM
+# op per 134-204 cycles nearly independent of op size; our gather op is 8 rows = 2 KB bf16 /
+# 1 KB fp8, four per 32-column slab) say the gather of one slab is ~4 serialized TDM op slots
+# (~550-800 cycles) + an LDS round trip on the critical path of every small-C wave; a direct
+# load batch is ONE memory round trip. No LDS is allocated (occupancy = VGPRs only).
+#   kd 1  loads at the point of use (ll=2 kernel / ll=2 multi-slab / ll=3 hit + miss paths);
+#         with ``slabs`` > 1 (ll=2) the loads of slab s+1 are issued before slab s is computed
+#         (register double buffer, one memory round trip ahead).
+#   kd 2  ll=3 single slab: the speculative request's K loads issued right after its lane page
+#         ids, BEFORE the hit / visible checks (pinned so they are not sunk into the hit branch);
+#         the miss path re-loads with the real request.
+# Constraints: wave_cols 32, ll >= 2, no sg / sw, fp8 needs fk (raw 2 x b64 per K step).
+KD_MODES = (0, 1, 2)
+
+
+def _check_kd(kd, is_fp8: bool, ll: int, fk: int, sg: int, sw: int, slabs: int, wave_cols: int):
+    v = int(kd)
+    if v not in KD_MODES:
+        raise ValueError(f"kd must be one of {KD_MODES}")
+    if not v:
+        return 0
+    if int(ll) < 2:
+        raise ValueError("kd (K direct) needs the ll >= 2 prologue (lane page ids)")
+    if int(sg) or int(sw):
+        raise ValueError("kd (K direct) replaces the TDM gather: no sg / sw")
+    if is_fp8 and not int(fk):
+        raise ValueError("fp8 kd (K direct) needs fk=1 (raw 2 x b64 fragments)")
+    if int(wave_cols) != 32:
+        raise ValueError("kd (K direct) needs wave_cols 32")
+    if v == 2 and (int(ll) != 3 or int(slabs) != 1):
+        raise ValueError("kd=2 (speculative K loads) is the ll=3 single-slab body only")
+    if int(ll) == 3 and int(slabs) != 1:
+        raise ValueError("kd with ll=3 needs slabs=1 (multi-slab kd uses ll=2)")
+    return v
+
+
+def _kd_tag(kd: int) -> str:
+    return f"_kd{kd}" if kd else ""
+
+
+def _pin_vecs(vals):
+    """DEC20D kd=2: empty side-effecting inline asm reading vector values as VGPR operands
+    (keeps the speculative K loads in the prologue; their wait lands here, after the hit
+    computation)."""
+    from flydsl._mlir.dialects import llvm
+
+    vals = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
+    if not vals:
+        return
+    llvm.inline_asm(
+        None, vals, "; dec20d pin", ",".join(["v"] * len(vals)), has_side_effects=True
+    )
+
+
 def _kraw_fp8_fk(src, byte_off, kgrp):
     """DEC20B fk: the lane's 2 x 8 fp8 bytes of one K step from the TDM tile (two ds_load_b64
     at ``byte_off + kgrp * 8`` and ``+ 16``) -- the dwords the b128 path selects by kgrp."""
@@ -7617,6 +7675,7 @@ def _build_decode_group_kernel(
     fk: int = 0,
     sg: int = 0,
     sw: int = 0,
+    kd: int = 0,
 ):
     """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
 
@@ -7638,6 +7697,7 @@ def _build_decode_group_kernel(
     if ll == 3 and slabs != 1 and not sg:  # DEC20B: speculative group request, single slab
         raise ValueError("decode-group ll=3 (speculative group request) requires slabs=1")
     fk = _check_fk(fk, is_fp8, ll)
+    kd = _check_kd(kd, is_fp8, ll, fk, sg, sw, slabs, wave_cols)  # DEC20D (0 = unchanged)
     if slabs > 1 and wave_cols != 32:
         # no-device builds: fp8 w64 x 2 slabs needs 241-252 VGPRs, x 4 slabs 265-290
         # (> 256: VGPR-MSB addressing, WMMA hazards in the scan) -> 32-column slabs only
@@ -7689,6 +7749,7 @@ def _build_decode_group_kernel(
         + (f"_ms{slabs}" if slabs != 1 else "")
         + _fk_tag(fk)
         + _sg_tag(sg, sw)
+        + _kd_tag(kd)
     )
 
     def _i01(cond):
@@ -7705,12 +7766,20 @@ def _build_decode_group_kernel(
         return t
 
     def _storage():
+        if kd:  # DEC20D: K direct to VGPRs -> no LDS tile
+            return None
         return (
             fx.SharedAllocator(base_alignment=128, static=True)
             .allocate(fx.Array[fx.Int32, waves * tile_bytes // 4, 128])
             .peek()
             .ptr
         )
+
+    def _ksrc_k(storage, tile, kv_rsrc):
+        """K fragment source of LDS tile ``tile`` (DEC20D kd: the K cache plane itself)."""
+        if kd:
+            return kv_rsrc
+        return storage + tile * (tile_bytes // 4)
 
     def _meta_lanes(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, n, lane):
         """ROUND-DEC20 ll=2: the group's n rows' (req, ctx, pos) with ONE per-lane vector
@@ -7947,6 +8016,8 @@ def _build_decode_group_kernel(
 
     def _issue(KV, storage, pt_rsrc, pp, col0, width, num_pages, wave, pre=None):
         # SGPR-only descriptors (wave_id, pass request, page table); wave-private tile.
+        if kd:  # DEC20D: no TDM gather (K loaded by the WMMA lanes themselves)
+            return
         for group in range_constexpr(wave_cols // 8):
             if pre is not None:  # ROUND-DEC20 ll: row ids loaded in the prologue
                 row_ids = pre[0][group]
@@ -8028,7 +8099,8 @@ def _build_decode_group_kernel(
         pp = plans[0]
         cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
         pre0 = (
-            _rowids_pass(pt_rsrc, pp, col0, width, num_pages, nreq),
+            # DEC20D kd: no TDM row ids (no gather)
+            None if kd else _rowids_pass(pt_rsrc, pp, col0, width, num_pages, nreq),
             _lane_pages_pass(pt_rsrc, pp, cols, width, num_pages),
         )
         if fk and ks_rsrc is not None:  # DEC20B_FK: tiles' K scales under the gather
@@ -8060,11 +8132,27 @@ def _build_decode_group_kernel(
 
     def _tensor_done():
         # Same-wave consumer: data is in LDS once TENSORcnt reaches 0.
+        if kd:  # DEC20D: no TDM op in flight
+            return
         fx.rocdl.tdm_ops.tensor_wait(0)
 
     def _war_guard():
         # This wave's LDS reads retired before a later pass's gather overwrites the tile.
+        if kd:  # DEC20D: no LDS tile
+            return
         fx.rocdl.s_wait_dscnt(0)
+
+    def _kd_frag_bf16(rsrc, byte_off, kgrp):
+        """DEC20D kd: the lane's bf16 B fragment of one K step straight from the cache
+        (16 B at ``byte_off`` + 16 B at ``+ 32``: the bytes ``_kfrag_bf16`` reads from LDS)."""
+        lo = _ld_vec(rsrc, byte_off, 4, fx.Int32)
+        hi = _ld_vec(rsrc, byte_off + 32, 4, fx.Int32)
+        return lo.shuffle(hi, list(range(8)))
+
+    def _kd_raw_fp8(rsrc, byte_off, kgrp):
+        """DEC20D kd: ``_kraw_fp8_fk`` from the cache (2 x b64 at ``+ kgrp * 8``, ``+ 16``)."""
+        off = byte_off + kgrp * 8
+        return _ld_vec(rsrc, off, 2, fx.Int32), _ld_vec(rsrc, off + 16, 2, fx.Int32)
 
     def _kfrag_bf16(src, byte_off, kgrp):
         lo = Vec(
@@ -8157,8 +8245,14 @@ def _build_decode_group_kernel(
         num_pages,
         pre=None,
         wbase=None,
+        tiles_pre=None,
+        load_only=False,
     ):
         """[(store_ok, byte_off, value)]: rows a/b of every tile column (r16 order).
+
+        DEC20D (kd only; defaults = unchanged): ``load_only`` returns the slab's ``_tile_k``
+        results (the K loads issued, nothing computed); ``tiles_pre`` = such a list loaded
+        earlier by the caller (register double buffer / speculative loads).
 
         DEC20C ``wbase`` (sw kernels only; None = unchanged): the caller did NOT wait for the
         slab's gathers; N tile nt waits until TENSORcnt <= wbase + n_ops - 2 (nt + 1) (its two
@@ -8180,6 +8274,23 @@ def _build_decode_group_kernel(
                 phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
                 page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
                 phys = page_ok.select(phys, 0)
+            if kd:  # DEC20D: lane loads straight from the cache row (phys validated, 0 if not)
+                k_base = (phys * P + off) * key_row_bytes + pp.kgrp * kgrp_bytes
+                if fk:
+                    kf = [
+                        _kd_raw_fp8(ksrc, k_base + s * kstep_k, pp.kgrp)
+                        for s in range_constexpr(WMMA_K_STEPS)
+                    ]
+                else:
+                    kf = [
+                        _kd_frag_bf16(ksrc, k_base + s * kstep_k, pp.kgrp)
+                        for s in range_constexpr(WMMA_K_STEPS)
+                    ]
+                if pre is not None and len(pre) > 2:
+                    scale = pre[2][nt]
+                else:
+                    scale = scale_fn(ks_rsrc, phys, off)
+                return kf, page_ok, scale
             k_base = local * pitch + pp.kgrp * kgrp_bytes
             if fk:  # DEC20B_FK: raw fp8 fragments only (converted after the batch)
                 kf = [
@@ -8206,7 +8317,22 @@ def _build_decode_group_kernel(
             return acc_t.load()
 
         split = wbase is not None  # DEC20C sw (trace-time)
-        if split:
+        if kd:  # DEC20D: every lane K load of the slab issued, then (convert +) WMMA
+            if tiles_pre is not None:
+                tiles = tiles_pre
+            else:
+                tiles = [_tile_k(nt) for nt in range_constexpr(n_tiles)]
+            if load_only:
+                return tiles
+            fx.rocdl.sched_barrier(0)
+            if fk:
+                accs = [
+                    _tile_mma([_kcvt_fp8_fk(r) for r in tiles[nt][0]])
+                    for nt in range_constexpr(n_tiles)
+                ]
+            else:
+                accs = [_tile_mma(tiles[nt][0]) for nt in range_constexpr(n_tiles)]
+        elif split:
             tiles, accs = [], []
             for nt in range_constexpr(n_tiles):
                 fx.rocdl.tdm_ops.tensor_wait(int(wbase) + n_tiles * 2 - 2 * (nt + 1))
@@ -8239,7 +8365,7 @@ def _build_decode_group_kernel(
         out = []
         for nt in range_constexpr(n_tiles):
             c = cols[nt]
-            if sched == "kpipe" or fk or split:
+            if sched == "kpipe" or fk or split or kd:
                 page_ok, scale, acc = tiles[nt][1], tiles[nt][2], accs[nt]
             else:
                 kf, page_ok, scale = _tile_k(nt)
@@ -8320,7 +8446,7 @@ def _build_decode_group_kernel(
         offs = _store_offsets(t0, kgrp, cols, rows, columns)
         neg_inf = fx.Float32(_NEG_INF)
         storage = _storage()
-        ksrc = storage + wave * (tile_bytes // 4)
+        ksrc = _ksrc_k(storage, wave, _kv_rsrc)
         for p in range_constexpr(n_pass):
             pp = plans[p]
             if pp.active:
@@ -8360,6 +8486,8 @@ def _build_decode_group_kernel(
     n_ops = wave_cols // 8  # TDM gather instructions per slab
 
     def _storage_ms():
+        if kd:  # DEC20D: no LDS tiles (register double buffer)
+            return None
         return (
             fx.SharedAllocator(base_alignment=128, static=True)
             .allocate(fx.Array[fx.Int32, 2 * waves * tile_bytes // 4, 128])
@@ -8394,6 +8522,8 @@ def _build_decode_group_kernel(
 
     def _issue_next(KV, storage, pt_rsrc, pp, s, c0s, width, num_pages, wave, presl, p):
         """Gather slab s+1 into the other buffer, then wait for slab s's gathers."""
+        if kd:  # DEC20D: the next slab's K loads are issued by the kd loop itself
+            return
         if s + 1 < slabs:
             _issue(
                 KV,
@@ -8463,9 +8593,7 @@ def _build_decode_group_kernel(
         colss, offss = _slab_lists(c0s, t0, kgrp, n_in, rows, columns)
         neg_inf = fx.Float32(_NEG_INF)
         storage = _storage_ms()
-        ksrcs = [
-            storage + (wave * 2 + b) * (tile_bytes // 4) for b in range_constexpr(2)
-        ]
+        ksrcs = [_ksrc_k(storage, wave * 2 + b, _kv_rsrc) for b in range_constexpr(2)]
         for p in range_constexpr(n_pass):
             pp = plans[p]
             if pp.active:
@@ -8525,6 +8653,124 @@ def _build_decode_group_kernel(
                             if msk[j2][0]:
                                 _st_f32(logits_rsrc, msk[j2][1], neg_inf)
 
+    # ---- ROUND-DEC20D kd multi-slab (ll=2, slabs > 1): register double buffer ------------
+    def _kd_tiles(atom, ksrc, ks_rsrc, pt_rsrc, qf, pp, c0, cols, offs, n_in, columns, width,
+                  num_pages, pre):
+        """The slab's K lane loads issued now (``_tile_k`` results, nothing computed)."""
+        return _pass_values(
+            atom, ksrc, ks_rsrc, pt_rsrc, qf, pp, c0, cols, offs, n_in, columns, width,
+            num_pages, pre, None, None, True,
+        )
+
+    def _kd_next(atom, ksrc, ks_rsrc, pt_rsrc, qf, pp, s, c0s, colss, offss, n_in, columns,
+                 width, num_pages, presl, p):
+        """Slab s+1's K loads (None after the last slab), fenced before slab s's compute."""
+        if s + 1 >= slabs:
+            return None
+        t = _kd_tiles(
+            atom, ksrc, ks_rsrc, pt_rsrc, qf, pp, c0s[s + 1], colss[s + 1], offss[s + 1],
+            n_in, columns, width, num_pages, presl[s + 1][p],
+        )
+        fx.rocdl.sched_barrier(0)
+        return t
+
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
+    def kernel_ms_kd(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bx = fx.Int32(fx.block_idx.x)
+        grp = fx.Int32(fx.block_idx.y)
+        wave = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        t0 = grp * group_rows
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+        plans, my_vis, meta_off, writer = group_head(
+            t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave
+        )
+        c0s, c0n = _slab_cols(bx, wave)
+        presl = _slab_pres(
+            pt_rsrc, plans, c0s, n_in, width, num_pages, num_requests, ks_rsrc=ks_rsrc
+        )
+        if writer:
+            _st_i32(vis_rsrc, meta_off, my_vis)
+            _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
+        )
+        colss, offss = _slab_lists(c0s, t0, kgrp, n_in, rows, columns)
+        neg_inf = fx.Float32(_NEG_INF)
+        pp0 = plans[0]
+        if pp0.active:
+            # slab 0's loads, then per slab: slab s+1's loads, slab s's compute (every load
+            # in bounds: page ids validated, 0 when invalid -> dead slabs read page 0)
+            nxt = _kd_tiles(
+                atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp0, c0s[0], colss[0], offss[0], n_in,
+                columns, width, num_pages, presl[0][0],
+            )
+            for s in range_constexpr(slabs):
+                cur = nxt
+                nxt = _kd_next(
+                    atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp0, s, c0s, colss, offss, n_in,
+                    columns, width, num_pages, presl, 0,
+                )
+                if c0s[s] < pp0.vmax:
+                    res = _pass_values(
+                        atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp0, c0s[s], colss[s], offss[s],
+                        n_in, columns, width, num_pages, presl[s][0], None, cur,
+                    )
+                    for j1 in range_constexpr(len(res)):
+                        if res[j1][0]:
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                if c0s[s] >= pp0.vmax:
+                    msk = _pass_masks(pp0, colss[s], offss[s], columns)
+                    for j2 in range_constexpr(len(msk)):
+                        if msk[j2][0]:
+                            _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+        for p in range_constexpr(1, n_pass):  # mixed groups only: loads at the point of use
+            pp = plans[p]
+            if pp.active:
+                for s2 in range_constexpr(slabs):
+                    if c0s[s2] < pp.vmax:
+                        res2 = _pass_values(
+                            atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, c0s[s2], colss[s2],
+                            offss[s2], n_in, columns, width, num_pages, presl[s2][p],
+                        )
+                        for j3 in range_constexpr(len(res2)):
+                            if res2[j3][0]:
+                                _st_f32(logits_rsrc, res2[j3][1], res2[j3][2])
+                    if c0s[s2] >= pp.vmax:
+                        msk2 = _pass_masks(pp, colss[s2], offss[s2], columns)
+                        for j4 in range_constexpr(len(msk2)):
+                            if msk2[j4][0]:
+                                _st_f32(logits_rsrc, msk2[j4][1], neg_inf)
+
     # ---- ROUND-DEC20B ll=3: speculative group request (DEC20B_SPEC; slabs == 1) ------
     # MTP verify / decode batches put each request's rows in consecutive groups of
     # ``group_rows`` (trace4: t2r[row] = row // 4, verify3 g3: row // 3), so group ``grp``
@@ -8581,6 +8827,29 @@ def _build_decode_group_kernel(
             writer = _writer_x(lane, meta, bx, wave, my_row, rows)
         return plans, my_vis, _imin(my_row, rows - 1) * 4, writer
 
+    def _kd_spec(kv_rsrc, ks_rsrc, pt_rsrc, spec, spec_ok, kgrp, col0, n_in, columns, width,
+                 num_pages, pres_s):
+        """DEC20D kd=2: the speculative request's K lane loads (right after its lane page ids,
+        before the hit / visible checks); None (no ops) unless kd == 2."""
+        if kd != 2:
+            return None
+        cols = [col0 + nt * WMMA_N + n_in for nt in range_constexpr(n_tiles)]
+        return _pass_values(
+            None, kv_rsrc, ks_rsrc, pt_rsrc, None, _SpecReq(spec, spec_ok, kgrp), col0, cols,
+            None, n_in, columns, width, num_pages, pres_s[0], None, None, True,
+        )
+
+    def _kd_pin(tiles):
+        """DEC20D kd=2: keep the speculative K loads out of the hit branch (machine sinker);
+        their wait lands here, after the hit computation."""
+        if tiles is None:
+            return
+        vals = []
+        for kf, _ok, _sc in tiles:
+            for f in kf:
+                vals.extend([f[0], f[1]] if fk else [f])
+        _pin_vecs(vals)
+
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel_spec(
         Q,
@@ -8636,9 +8905,13 @@ def _build_decode_group_kernel(
         hit = _spec_hit(vm_s, spec, spec_ok)
         miss = hit == 0
         pres_s = _spec_fk(pres_s, ks_rsrc, col0, n_in)
+        # DEC20D kd=2: the speculative request's K loads now (None otherwise: no ops)
+        spec_t = _kd_spec(_kv_rsrc, ks_rsrc, pt_rsrc, spec, spec_ok, kgrp, col0, n_in,
+                          columns, width, num_pages, pres_s)
         plans_h, my_vis_h, meta_off_h, writer_h = _head_vm(
             t0, rows, num_requests, kgrp, lane, bx, wave, vm_s
         )
+        _kd_pin(spec_t)
         pp_h = plans_h[0]
         atom = fx.make_mma_atom(
             fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32)
@@ -8647,7 +8920,7 @@ def _build_decode_group_kernel(
         offs = _store_offsets(t0, kgrp, cols, rows, columns)
         neg_inf = fx.Float32(_NEG_INF)
         storage = _storage()
-        ksrc = storage + wave * (tile_bytes // 4)
+        ksrc = _ksrc_k(storage, wave, _kv_rsrc)
         # (the two blocks are exclusive; LLVM lays the hit block out after the miss body as
         # a taken branch whatever their source order or an llvm.expect hint -- no-device ISA)
         if miss:
@@ -8741,6 +9014,8 @@ def _build_decode_group_kernel(
                         width,
                         num_pages,
                         pres_s[0],
+                        None,
+                        spec_t,  # DEC20D kd=2: loaded before the hit check (None: unchanged)
                     )
                     for j1 in range_constexpr(len(res_h)):
                         if res_h[j1][0]:
@@ -9114,6 +9389,8 @@ def _build_decode_group_kernel(
 
     if sg:
         selected_kernel = kernel_spec_sg
+    elif slabs > 1 and kd:
+        selected_kernel = kernel_ms_kd  # DEC20D
     elif slabs > 1:
         selected_kernel = kernel_ms
     elif ll == 3:
@@ -9176,6 +9453,7 @@ def _build_decode_group_kernel(
     launch.slabs = slabs
     launch.cols_per_block = span * slabs
     launch.sg, launch.sw = sg, sw  # DEC20C
+    launch.kd = kd  # DEC20D
     return launch
 
 

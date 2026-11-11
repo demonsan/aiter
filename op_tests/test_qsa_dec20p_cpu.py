@@ -221,8 +221,20 @@ class OverlayDecisions(base.Env):
             ),
         ):
             d, p = self._plan(args, profile=PR.DEFAULT_PROFILE)
-            self.assertEqual(d.cell, f"rule:{cell}", d)
-            self.assertNotIn("ll", p.build_kw)
+            committed = _committed()
+            overlays_checked = all(
+                e["golden"]["status"] == "pass"
+                for e in committed["rules"]
+                if e["id"].startswith(cell + "_")
+            )
+            if overlays_checked:
+                # GPU-checked overlays (DEC20-PROMOTE step 6): an overlay serves, base does not
+                self.assertTrue(d.cell.startswith(f"rule:{cell}_"), d)
+                self.assertIn("ll", p.build_kw)
+            else:
+                # pending overlays are never selected: the unchanged base rule serves
+                self.assertEqual(d.cell, f"rule:{cell}", d)
+                self.assertNotIn("ll", p.build_kw)
 
     def test_decode_overlays(self):
         cases = (

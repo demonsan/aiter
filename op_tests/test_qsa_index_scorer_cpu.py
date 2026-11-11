@@ -1298,6 +1298,33 @@ def _gen():
     return gen
 
 
+def legacy_profile(td):
+    """DEC20-PROMOTE: the committed profile without the knob-pinned overlays
+    (``gen_profile.strip_dec20p`` = the pre-promotion rule / bucket set, byte-identical
+    entries) written to ``td`` under the committed file stem, for the checks that pin the
+    legacy (base-rule) semantics; the shipped default serves the GPU-checked overlays.
+    """
+    with open(PROFILE_JSON, encoding="utf-8") as fh:
+        data = _gen().strip_dec20p(json.load(fh))
+    PR.validate_profile(data)
+    path = os.path.join(td, os.path.basename(PROFILE_JSON))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    return path
+
+
+def dec20p_overlay_ids(entry_id, gen=None):
+    """Ids of the DEC20-PROMOTE overlays of a base rule / bucket id (all listed right before
+    it; empty for an overlay or an entry without overlays)."""
+    gen = gen or _gen()
+    for table in (gen.DEC20P_RULES, gen.DEC20P_BUCKETS):
+        hit = gen._dec20p_base(entry_id, table)
+        if hit is not None:
+            b0, sfx = hit
+            return {f"{b0}_{t}{sfx}" for t, *_ in table[b0]}
+    return set()
+
+
 def _gpu_stamp_kernels(ksha):
     """Kernels whose GPU stamps count as on the profiled kernel ``ksha``: ``ksha`` itself
     and (AITER-LINT, black/ruff only) the R2E kernel the GPU check ran on, provided the
@@ -2339,14 +2366,31 @@ class Dispatch(_Stubs):
             p = {"k_load": a[2], "wave_cols": a[3]}
             if a[0]:
                 p.update(sched=K.draft_fp8_sched(), pk8=pk8)
-            if "wg_waves" in kw:  # launch knob (R2E: fp8 'auto' = 2)
+            # launch knob (R2E: fp8 'auto' = 2; DEC20-PROMOTE: fp8 pins 4 explicitly, a
+            # pinned bf16 knob set passes the default 4 along with ll)
+            if kw.get("wg_waves", 4) != 4 or (a[0] and "wg_waves" in kw):
                 p["wg_waves"] = kw["wg_waves"]
+            for knob in ("ll", "fk"):  # DEC20 knobs: keyword only when pinned on
+                if kw.get(knob):
+                    p[knob] = kw[knob]
             return "qsa.page4.draft.v1", p
         if kind == "decg":
             p = {"k_load": "tdm", "wave_cols": a[2], "barrier": False}
             if a[0]:
                 p.update(sched=K.decg_fp8_sched(), pk8=pk8)
-            for knob, default in (("group_rows", 4), ("wg_waves", 4)):
+                if a[2] == 32 and kw.get("group_rows", 4) == 4:
+                    # DEC20-PROMOTE: pinned wc 32 on the fp8 4-row router variant (w64)
+                    p.update(wave_cols=64, wc=32)
+            for knob, default in (
+                ("group_rows", 4),
+                ("wg_waves", 4),
+                ("ll", 0),
+                ("fk", 0),
+                ("slabs", 1),
+                ("sg", 0),
+                ("sw", 0),
+                ("kd", 0),
+            ):
                 if kw.get(knob, default) != default:
                     p[knob] = kw[knob]
             return "qsa.page4.decg.v1", p
@@ -2446,13 +2490,17 @@ class Dispatch(_Stubs):
         self.assertGreaterEqual(n_ver, 14)
 
     def test_rule_samples_dispatch_their_variant(self):
-        """Rule samples (allow_unverified sweep path) launch exactly the rule's variant."""
+        """Rule samples (allow_unverified sweep path) launch exactly the serving rule's
+        variant (incl. its pinned launch knobs): the rule itself or -- DEC20-PROMOTE -- one of
+        the GPU-checked overlays listed right before it (they tile its requests x columns).
+        """
         prof = PR.load_profile(PR.DEFAULT_PROFILE)
-        n = 0
-        overlays = _gen().dec20p_ids()  # DEC20-PROMOTE: test_qsa_dec20p_cpu.py
+        by_cell = {r.cell: r for r in [*prof.rows, *prof.rules]}
+        gen = _gen()
+        overlays = gen.dec20p_ids()
+        n = n_ov = n_by_ov = 0
         for rule in prof.rules:
-            if rule.id in overlays:
-                continue
+            ov_cells = {f"rule:{i}" for i in dec20p_overlay_ids(rule.id, gen)}
             small = [
                 s
                 for s in rule.raw["samples"]
@@ -2492,19 +2540,33 @@ class Dispatch(_Stubs):
                     *args, profile=self.profile, allow_unverified=True, buckets=False
                 )
                 self.assertTrue(d.ok, (rule.id, s, d))
-                # the rule itself, or an exact row (precedence) -- never a bucket / other rule
+                # the rule itself, a checked overlay of it, or an exact row (precedence) --
+                # never a bucket / other rule
                 self.assertTrue(
                     d.cell == f"rule:{rule.id}"
+                    or d.cell in ov_cells
                     or not d.cell.startswith(("rule:", "bucket:")),
                     (rule.id, s, d),
                 )
+                served = by_cell.get(d.cell, rule)
                 kind, a, kw = self.kinds[0]
                 self.assertEqual(
-                    self._vid(kind, a, kw), (rule.vid, dict(rule.params)), (rule.id, s)
+                    self._vid(kind, a, kw),
+                    (served.vid, dict(served.params)),
+                    (rule.id, s, d.cell),
                 )
                 self.assertEqual(tuple(logits.shape), (s["rows"], s["columns"]))
                 n += 1
+                n_ov += rule.id in overlays
+                n_by_ov += d.cell in ov_cells
         self.assertGreaterEqual(n, 20)
+        if all(
+            by_cell[f"rule:{i}"].verified for i in overlays if f"rule:{i}" in by_cell
+        ):
+            # DEC20-PROMOTE (GPU-checked): overlay samples serve their overlay and the base
+            # decode / draft rules' samples are served by their overlays
+            self.assertGreater(n_ov, 100)
+            self.assertGreater(n_by_ov, 50)
 
     def test_try_and_raise(self):
         args = call_args(columns=1000)
@@ -2598,16 +2660,29 @@ class Launch(_Stubs):
         self.assertEqual(len(self.runs), 1)
         return out, list(self.kinds), self.runs[0]
 
-    def _same_launch(self, ref, got, caller_ptrs, label):
+    def _same_launch(self, ref, got, caller_ptrs, label, pinned=None):
+        """``pinned`` (DEC20-PROMOTE, wrapper reference only): the serving entry's pinned
+        launch-knob builder keywords (``api._knob_kw``) -- the default-env wrapper has no
+        such knobs, so its launch must differ by exactly these keywords (and, for a pinned
+        ``wc``, by the builder slab and the grid it implies)."""
         (ref_out, _, (ref_l, ref_a)), (out, _, (l, a)) = ref, got
         # same builder + same (args, kwargs) => same lru_cache entry / compiled function
-        self.assertEqual((ref_l.kind, ref_l.build_args), (l.kind, l.build_args), label)
+        want = ref_l.build_args
+        if pinned:
+            (pa, pkw), wc = want, pinned.get("wc")
+            if wc:  # the pinned slab replaces the router's
+                pa = (*pa[:2], wc, *pa[3:])
+            knob_kw = {k: v for k, v in pinned.items() if k != "wc"}
+            want = (pa, {**pkw, **knob_kw})
+        self.assertEqual((ref_l.kind, want), (l.kind, l.build_args), label)
         self.assertEqual(len(ref_a), len(a), label)
         g = next(
             i for i, x in enumerate(ref_a) if isinstance(x, int)
         )  # grid_x position
         outputs = range(g - 3, g)  # logits, visible, starts
         for i, (x, y) in enumerate(zip(ref_a, a)):
+            if pinned and i in (g, g + 1):
+                continue  # grid of the pinned slab / wg_waves (checked against the plan)
             self.assertIs(type(x), type(y), (label, i))
             if isinstance(x, torch.Tensor):
                 self.assertEqual(
@@ -2630,7 +2705,9 @@ class Launch(_Stubs):
         prof = PR.load_profile(PR.DEFAULT_PROFILE)
         classes = _pass_call_classes(prof)
         self.assertGreaterEqual(len(classes), 20)
-        n = 0
+        entries = {e.cell: e for e in [*prof.rows, *prof.rules]}
+        overlays = {f"rule:{i}" for i in _gen().dec20p_ids()}
+        n = n_ov = 0
         for label, spec in classes:
             for qp64 in (True, False):
                 for meta64 in (False, True):
@@ -2686,7 +2763,23 @@ class Launch(_Stubs):
                         got = self._calls(
                             lambda: API.launch(d, *a, logits=lg, visible_groups=vg)
                         )
-                    self._same_launch(ref, got, caller, (label, qp64, meta64))
+                    # DEC20-PROMOTE: a GPU-checked overlay serves with its pinned knobs
+                    # (the wrapper reference launches the same variant without them)
+                    served = entries[d.cell]
+                    knobs = PR.split_knobs(served.vid, served.params)[1]
+                    pinned = None
+                    if d.cell in overlays:
+                        pinned = dict(API._knob_kw(served.vid, served.params))
+                        if knobs.get("wc"):
+                            pinned["wc"] = knobs["wc"]
+                        self.assertTrue(pinned, (label, d.cell))
+                        n_ov += 1
+                        gx, gy = d._plan.grid(spec["rows"])
+                        g = next(
+                            i for i, x in enumerate(got[2][1]) if isinstance(x, int)
+                        )
+                        self.assertEqual(tuple(got[2][1][g : g + 2]), (gx, gy), label)
+                    self._same_launch(ref, got, caller, (label, qp64, meta64), pinned)
                     self._same_launch(op, got, caller, (label, qp64, meta64, "op"))
                     self.assertEqual(got[0][0].data_ptr(), lg.data_ptr())
                     self.assertEqual(got[0][1].data_ptr(), vg.data_ptr())
@@ -2694,6 +2787,8 @@ class Launch(_Stubs):
                     self.assertEqual(got[1][-1][2].get("pos64", False), qp64, label)
                     n += 1
         self.assertGreaterEqual(n, 80)
+        if any(entries[c].verified for c in overlays if c in entries):
+            self.assertGreater(n_ov, 100)  # every checked overlay's samples x 4
 
     def test_launch_allocates_outputs_like_the_wrapper(self):
         # R2E: the bf16 r512q2 prefill row is pending (persist ISA changed); the fp8 one
@@ -2896,7 +2991,12 @@ class Prewarm(_Stubs):
         builds = self._expected_builds(("bf16", "fp8"))
         # + fp8 ktile C4 (rows > 2048) and the pass g3 decode-group buckets (bf16 + fp8),
         # 3 pages x 2 pos dtypes each
-        self.assertEqual(len(builds), 54 if RR_PENDING else 78)
+        # DEC20-PROMOTE: + the GPU-checked overlays' distinct knob-pinned builds (same
+        # variants / tags), 3 pages x 2 pos dtypes x (bf16: draft 2 {ll3 wg2, ll3} + decode
+        # group 6 + g3 bucket 2; fp8: draft 2 {ll3 fk wg4, ll3 fk wg2} + decode group 2 {wc32
+        # ll3 fk kd1, ll2 fk} + g3 bucket 3) = 102
+        ov = 102 if self._overlays_checked() else 0
+        self.assertEqual(len(builds), (54 if RR_PENDING else 78) + ov)
         self.assertEqual(
             len(self.runs), len(builds)
         )  # one private launch each (FlyDSL JIT)
@@ -2904,7 +3004,11 @@ class Prewarm(_Stubs):
         self.assertEqual(len(built), len(builds))
         vids = {Dispatch._vid(k, a, kw)[0] for k, a, kw in self.kinds}
         self.assertEqual(vids, {t.split("/")[0] for t in want})
-        self.assertEqual(sum(kw.get("group_rows") == 3 for _, _, kw in self.kinds), 12)
+        # + the 5 overlay g3 bucket knob sets (bf16 2, fp8 3) x 3 pages x 2 pos dtypes
+        self.assertEqual(
+            sum(kw.get("group_rows") == 3 for _, _, kw in self.kinds),
+            12 + (30 if ov else 0),
+        )
         # pending-only variants and fp8 are not built by default
         self.kinds.clear()
         self.runs.clear()
@@ -2914,7 +3018,15 @@ class Prewarm(_Stubs):
         )
         self.assertTrue(all("/bf16/" in t for t in self._expected(("bf16",))))
         self.assertEqual(len(self.runs), len(self._expected_builds(("bf16",))))
-        self.assertEqual(len(self.runs), 28 if RR_PENDING else 36)
+        # + bf16 overlays: 10 knob sets x 3 pages x 2 pos dtypes
+        self.assertEqual(len(self.runs), (28 if RR_PENDING else 36) + (60 if ov else 0))
+
+    @staticmethod
+    def _overlays_checked():
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        ids = _gen().dec20p_ids()
+        ov = [e for e in [*prof.rules, *prof.buckets] if e.id in ids]
+        return bool(ov) and all(e.verified for e in ov)
 
     def test_builds_exactly_what_real_calls_build(self):
         """The builder (args, kwargs) of every pass call class == a prewarmed lru_cache key."""

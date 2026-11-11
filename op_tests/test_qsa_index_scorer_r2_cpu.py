@@ -423,9 +423,19 @@ class BucketOp(_R2Env):
                 self.assertTrue(
                     str(d.cell).startswith("bucket:verify3_pad4_bf16>"), (v, d)
                 )
-        # committed profile: the verified kernel-native g3 bucket is selected by default
-        d = API.decide(*args, profile=self.profile)
+        # committed profile: the verified kernel-native g3 bucket is selected by default --
+        # pre-promotion set: the base bucket; shipped (DEC20-PROMOTE, GPU-checked): its
+        # requests x columns overlay, same group_rows=3 launch + the pinned knobs
+        d = API.decide(*args, profile=base.legacy_profile(self.td))
         self.assertTrue(d.ok and str(d.cell).startswith("bucket:verify3_g3_bf16>"), d)
+        d = API.decide(*args, profile=self.profile)
+        self.assertTrue(
+            d.ok and str(d.cell).startswith("bucket:verify3_g3_bf16_s32>"), d
+        )
+        self.assertEqual(
+            d._plan.build_kw,
+            {"group_rows": 3, "row_mode": "dedup", "wg_waves": 4, "ll": 3, "sg": 2},
+        )
         # ... a 'fail' bucket never is (kernel without native 3-row groups -> staging
         # bucket verify3_pad4_bf16, committed 'fail' -> the call is matched unpadded)
         with mock.patch.object(API, "kernel_real_rows_per_group", return_value=()):
@@ -706,8 +716,30 @@ class PrewarmR2(base._Stubs):
 
     def test_scoped_to_bound_cache_and_pos_dtype(self):
         cache = aligned((8, 4, 1, 128), torch.bfloat16)
-        work = API.prewarm_plan(
+        # DEC20-PROMOTE: the shipped profile adds the GPU-checked overlays' knob-pinned
+        # builds of the same variants (same tags): 10 page-4 bf16 knob sets (draft 2, decode
+        # group 6, g3 bucket 2) on top of the pre-promotion set's 6 builds
+        shipped = API.prewarm_plan(
             self.profile, compressed_k_cache=cache, pos_dtypes=(torch.int64,), kernel=K
+        )
+        legacy = base.legacy_profile(self.td)
+        work = API.prewarm_plan(
+            legacy, compressed_k_cache=cache, pos_dtypes=(torch.int64,), kernel=K
+        )
+
+        def key(w):
+            return w[0], tuple(sorted(dict(w[2]).items()))
+
+        self.assertEqual({w[0] for w in shipped}, {w[0] for w in work})
+        self.assertLessEqual({key(w) for w in work}, {key(w) for w in shipped})
+        self.assertEqual((len(work), len(shipped)), (6, 16))
+        self.assertEqual(
+            sorted(
+                (w[0].split(".")[2], dict(w[2]).get("group_rows", 4))
+                for w in shipped
+                if key(w) not in {key(x) for x in work}
+            ),
+            [("decg", 3)] * 2 + [("decg", 4)] * 6 + [("draft", 4)] * 2,
         )
         # page-4 bf16 pass variants (draft / decode-group / r16 / lean ktile / persist) + the
         # verified kernel-native g3 bucket's own group_rows=3 decode-group specialization
@@ -723,7 +755,7 @@ class PrewarmR2(base._Stubs):
             ],
         )
         got = API.prewarm(
-            self.profile,
+            legacy,
             compressed_k_cache=cache,
             pos_dtypes=(torch.int64,),
             device="cpu",
@@ -947,10 +979,17 @@ class PrewarmR2(base._Stubs):
                 cache_dir=self.td,
             )
         work = API.prewarm_plan(self.profile, pos_dtypes=(torch.int64,), kernel=K)
-        # pages 4/8/16 x (draft, decode-group, decode-group g3 bucket, r16, ktile, persist)
-        # (RULES-REQUESTS: ktile / persist only once the widened prefill rules pass;
-        # page-4 ktile / persist exact rows keep 2 of them)
-        self.assertEqual(len(work), 14 if base.RR_PENDING else 18)
+        legacy = API.prewarm_plan(
+            base.legacy_profile(self.td), pos_dtypes=(torch.int64,), kernel=K
+        )
+        # pre-promotion set: pages 4/8/16 x (draft, decode-group, decode-group g3 bucket,
+        # r16, ktile, persist) (RULES-REQUESTS: ktile / persist only once the widened
+        # prefill rules pass; page-4 ktile / persist exact rows keep 2 of them)
+        self.assertEqual(len(legacy), 14 if base.RR_PENDING else 18)
+        # DEC20-PROMOTE (GPU-checked overlays): + pages 4/8/16 x 10 bf16 knob-pinned
+        # builds of the same draft / decode-group variants (no new tag)
+        self.assertEqual(len(work), len(legacy) + 30)
+        self.assertEqual({w[0] for w in work}, {w[0] for w in legacy})
         self.assertEqual(got, sorted({w[0] for w in work}))
         self.assertEqual(self.runs, [])  # nothing launched
         self.assertEqual(len(seen), len(work))
@@ -1111,7 +1150,30 @@ class Page8(_R2Env):
             page_size=8,
             **kw,
         )
-        self.assertTrue(m.ok and m.row.id == "decode_bf16_p8", m)  # GPU pass committed
+        # GPU pass committed: DEC20-PROMOTE serves the checked overlay of decode_bf16_p8
+        # (requests 1..16 x columns 16384..65536); the pre-promotion set the base rule
+        self.assertTrue(m.ok and m.row.id == "decode_bf16_l16_p8", m)
+        self.assertEqual(
+            dict(m.row.params),
+            {
+                "k_load": "tdm",
+                "wave_cols": 32,
+                "barrier": False,
+                "ll": 3,
+                "wg_waves": 2,
+            },
+        )
+        legacy = PR.load_profile(base.legacy_profile(self.td), use_cache=False)
+        m = PR.match(
+            legacy,
+            rows=64,
+            requests=16,
+            columns=16384,
+            table_width=2048,
+            page_size=8,
+            **kw,
+        )
+        self.assertTrue(m.ok and m.row.id == "decode_bf16_p8", m)
         m = PR.match(
             committed,
             rows=64,
@@ -1165,24 +1227,34 @@ class Page8(_R2Env):
         args = _verify3_args(8, columns=4096, width=512)
         args[1] = aligned((8, 8, 1, 128), torch.bfloat16)
         args[5].fill_(8 * 512)
-        # committed profile: the page-8 g3 bucket (pass) on the decode rule (pass), default on
-        ref = [
-            t.clone()
-            for t in API.launch(
-                API.decide(*args, profile=self.profile, buckets=False), *args
-            )
-        ]
-        d = API.decide(*args, profile=self.profile)
-        self.assertTrue(
-            d.ok and d.cell == "bucket:verify3_g3_bf16_p8>rule:decode_bf16_p8", d
-        )
-        self.assertEqual(d.vid, "qsa.page8.decg.v1")
-        self.assertEqual(
-            d._plan.build_kw,
-            {"page_size": 8, "group_rows": 3, "row_mode": "dedup", "wg_waves": 4},
-        )
-        out = API.launch(d, *args)
-        self.assertTrue(torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1]))
+        # committed profile: the page-8 g3 bucket (pass) on the decode rule (pass), default
+        # on -- pre-promotion set: the base bucket on the base rule; shipped (DEC20-PROMOTE,
+        # GPU-checked): the bucket's columns >= 4096 overlay on the decode rule's mid overlay
+        g3 = {"page_size": 8, "group_rows": 3, "row_mode": "dedup", "wg_waves": 4}
+        for prof, cell, kw in (
+            (
+                base.legacy_profile(self.td),
+                "bucket:verify3_g3_bf16_p8>rule:decode_bf16_p8",
+                g3,
+            ),
+            (
+                self.profile,
+                "bucket:verify3_g3_bf16_l_p8>rule:decode_bf16_m64_p8",
+                dict(g3, ll=3),
+            ),
+        ):
+            ref = [
+                t.clone()
+                for t in API.launch(
+                    API.decide(*args, profile=prof, buckets=False), *args
+                )
+            ]
+            d = API.decide(*args, profile=prof)
+            self.assertTrue(d.ok and d.cell == cell, d)
+            self.assertEqual(d.vid, "qsa.page8.decg.v1")
+            self.assertEqual(d._plan.build_kw, kw)
+            out = API.launch(d, *args)
+            self.assertTrue(torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1]))
         # staging bucket at page 8 (g3 reset to pending, pad4 marked pass)
         prof = _profile_copy(
             self.td,
@@ -1608,10 +1680,29 @@ class Fp8Rules(_R2Env):
                     },
                 ),
             )
-        # the committed profile: fp8 g3 bucket GPU pass -> selected
+        # the committed profile: fp8 g3 bucket GPU pass -> selected (pre-promotion set: the
+        # base bucket; shipped, DEC20-PROMOTE GPU-checked: its requests 1..16 x short
+        # columns overlay on the fp8 decode rule's overlay, same 32-column g3 slab)
         args = _fp8_verify3_args(8)
-        d = API.decide(*args, profile=self.profile)
+        d = API.decide(*args, profile=base.legacy_profile(self.td))
         self.assertTrue(d.ok and str(d.cell).startswith("bucket:verify3_g3_fp8>"), d)
+        d = API.decide(*args, profile=self.profile)
+        self.assertTrue(
+            d.ok and d.cell == "bucket:verify3_g3_fp8_s16>rule:decode_fp8_s", d
+        )
+        self.assertEqual(d._plan.build_args[2], 32)
+        self.assertEqual(
+            d._plan.build_kw,
+            {
+                "group_rows": 3,
+                "row_mode": "dedup",
+                "wg_waves": 2,
+                "ll": 3,
+                "fk": 1,
+                "sg": 2,
+                "sw": 1,
+            },
+        )
 
 
 _POW2 = {"pow2": {"min": 64, "max": 65536}}

@@ -20,6 +20,13 @@
   "supersedes": [],
   "version": 1
  },
+ "qkv_proj_fusion": {
+  "fingerprint": "2c8c570a9696ddec",
+  "signature": "hidden_states:positional:torch.Tensor, W_qkv:positional:torch.Tensor, W_idx:positional:torch.Tensor, q_norm_w:positional:torch.Tensor, k_norm_w:positional:torch.Tensor, iq_norm_w:positional:torch.Tensor, cos_cache:positional:torch.Tensor, sin_cache:positional:torch.Tensor, positions:positional:torch.Tensor, slot_mapping:positional:torch.Tensor, k_cache:positional:torch.Tensor, v_cache:positional:torch.Tensor, raw_k_cache:positional:torch.Tensor, pos_cache:positional:torch.Tensor | None=None, rotary_dim:positional:int=64, mrope_section_t:positional:int=16, mrope_section_h:positional:int=24, mrope_section_w:positional:int=24, interleaved:positional:bool=True, eps:positional:float=1e-06, mode:positional:str='decode', -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/qkv_proj_fusion.py",
+  "supersedes": [],
+  "version": 1
+ },
  "qsa_paged_mqa_logits": {
   "fingerprint": "543c36e43c589ce2",
   "signature": "q:positional:torch.Tensor, compressed_k_cache:positional:torch.Tensor, page_table:positional:torch.Tensor, token_to_request:positional:torch.Tensor, query_positions:positional:torch.Tensor, context_lens:positional:torch.Tensor, compress_ratio:positional:int=4, score_divisor:positional:float | None=None, max_columns:positional:int | None=None, row_starts:positional:torch.Tensor | None=None, allow_flydsl:positional:bool=False, compressed_k_scale:positional:torch.Tensor | None=None, stacked_decode:positional:bool | None=None, logits:keyword-only:torch.Tensor | None=None, visible_groups:keyword-only:torch.Tensor | None=None, -> tuple[torch.Tensor, torch.Tensor]",

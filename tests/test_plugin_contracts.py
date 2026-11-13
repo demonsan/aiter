@@ -648,6 +648,14 @@ _NOT_REGISTERED = {
     ),
     "rmsnorm": "unannotated contract; pure-torch body, as `pertoken_quant`",
     "pa_persistent_fwd": "no schema can express it (`QuantType` parameter)",
+    "qkv_proj_fusion": (
+        "the returned `gate` is a strided view of a projection buffer whose row "
+        "stride belongs to the implementation (the native path's is the QKV width, "
+        "a provider's is its own packed width), so no single fake can state the "
+        "strides of both, and inductor asserts a registered op's output strides "
+        "against its fake. Registering it would make one of the two paths fail "
+        "that assertion; it stays traced, as before registration existed"
+    ),
 }
 
 

@@ -125,6 +125,13 @@
   "supersedes": [],
   "version": 1
  },
+ "qkv_proj_fusion": {
+  "fingerprint": "402faf1101527342",
+  "signature": "hidden_states:positional:torch.Tensor, W_qkv:positional:torch.Tensor, W_idx:positional:torch.Tensor, q_norm_w:positional:torch.Tensor, k_norm_w:positional:torch.Tensor, iq_norm_w:positional:torch.Tensor, cos_cache:positional:torch.Tensor, sin_cache:positional:torch.Tensor, positions:positional:torch.Tensor, slot_mapping:positional:torch.Tensor, k_cache:positional:torch.Tensor, v_cache:positional:torch.Tensor, raw_k_cache:positional:torch.Tensor, pos_cache:positional:torch.Tensor | None=None, rotary_dim:positional:int=64, mrope_section_t:positional:int=11, mrope_section_h:positional:int=11, mrope_section_w:positional:int=10, interleaved:positional:bool=True, eps:positional:float=1e-06, mode:positional:str='decode', -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/qkv_proj_fusion.py",
+  "supersedes": [],
+  "version": 1
+ },
  "rmsnorm": {
   "fingerprint": "86344aea2f2c16a8",
   "signature": "input:positional, weight:positional, epsilon:positional, use_model_sensitive_rmsnorm:positional, -> Tensor",
